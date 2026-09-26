@@ -30,9 +30,10 @@ pub fn run(initial: Option<Region>) {
     std::process::exit(1);
 }
 
-// `ViewportBuilder::with_monitor` makes glutin fail to create the GL context
-// on Windows, and switching to borderless full screen later leaves a stale
-// surface there, so windows are placed over their monitor after creation.
+// Windows are placed over their monitor after creation instead of using
+// full screen: `ViewportBuilder::with_monitor` makes glutin fail to create
+// the GL context on Windows, borderless full screen leaves a stale surface
+// there, and macOS refuses full screen for borderless windows.
 fn overlay_builder() -> ViewportBuilder {
     ViewportBuilder::default()
         .with_decorations(false)
@@ -50,6 +51,8 @@ struct Monitor {
     /// Physical pixel rect as reported by winit, used for window placement.
     phys: Rect,
     placed: bool,
+    /// Placement tries so far; gives up eventually rather than loop forever.
+    attempts: u32,
     tex: Option<TextureHandle>,
 }
 
@@ -124,6 +127,7 @@ impl Overlay {
                     Vec2::new(size.width as f32, size.height as f32),
                 ),
                 placed: false,
+                attempts: 0,
                 tex,
             });
         }
@@ -357,27 +361,23 @@ impl Overlay {
             return;
         }
         let vp = ctx.input(|i| i.viewport().clone());
-        if cfg!(target_os = "macos") {
-            // Full screen is the only way to cover the menu bar on macOS.
-            m.placed = vp.fullscreen == Some(true);
-            if !m.placed {
-                ctx.send_viewport_cmd(egui::ViewportCommand::SetMonitor(idx));
-            }
-        } else {
-            let ppp = ctx.pixels_per_point();
-            let want =
-                Rect::from_min_size((m.phys.min.to_vec2() / ppp).to_pos2(), m.phys.size() / ppp);
-            m.placed = vp.inner_rect.is_some_and(|r| {
+        let ppp = ctx.pixels_per_point();
+        let want = Rect::from_min_size((m.phys.min.to_vec2() / ppp).to_pos2(), m.phys.size() / ppp);
+        m.attempts += 1;
+        m.placed = m.attempts > 120
+            || vp.inner_rect.is_some_and(|r| {
                 (r.min - want.min).length() < 0.5 && (r.size() - want.size()).length() < 0.5
             });
-            if !m.placed {
-                let border = match (vp.outer_rect, vp.inner_rect) {
-                    (Some(o), Some(i)) => i.min - o.min,
-                    _ => Vec2::ZERO,
-                };
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(want.min - border));
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(want.size()));
-            }
+        if !m.placed {
+            // Above the menu bar and Dock, or macOS keeps the window below them.
+            #[cfg(target_os = "macos")]
+            raise_windows();
+            let border = match (vp.outer_rect, vp.inner_rect) {
+                (Some(o), Some(i)) => i.min - o.min,
+                _ => Vec2::ZERO,
+            };
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(want.min - border));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(want.size()));
         }
         if m.placed {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -409,6 +409,40 @@ impl eframe::App for Overlay {
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         [0.0, 0.0, 0.0, 1.0]
+    }
+}
+
+/// Makes this process's windows (only the overlays live here) cover whole
+/// screens on macOS, the way winit's "simple fullscreen" does: hide the menu
+/// bar and Dock while we're active, so window frames aren't pushed below
+/// them, and float above everything, including other apps' full-screen
+/// Spaces.
+#[cfg(target_os = "macos")]
+fn raise_windows() {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{
+        NSApplication, NSApplicationPresentationOptions, NSWindowCollectionBehavior,
+    };
+
+    // NSScreenSaverWindowLevel: above the menu bar (24) and the Dock (20).
+    const LEVEL: isize = 1000;
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    #[allow(deprecated)]
+    app.activateIgnoringOtherApps(true);
+    // Hiding the menu bar requires hiding the Dock too.
+    app.setPresentationOptions(
+        NSApplicationPresentationOptions::HideDock | NSApplicationPresentationOptions::HideMenuBar,
+    );
+    for window in app.windows().iter() {
+        window.setLevel(LEVEL);
+        window.setHidesOnDeactivate(false);
+        window.setCollectionBehavior(
+            NSWindowCollectionBehavior::CanJoinAllSpaces
+                | NSWindowCollectionBehavior::FullScreenAuxiliary,
+        );
     }
 }
 
