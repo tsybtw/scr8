@@ -1,0 +1,47 @@
+[package]
+name = "scr8"
+version = "1.0.0"
+description = "Instant region screenshots bound to global hotkeys"
+license = "MIT"
+rust-version = "1.98"
+edition = "2024"
+
+[dependencies]
+auto-launch = "0.6.0"
+chrono = "0.4.45"
+crossbeam-channel = "0.5.17"
+dirs = "7.0.0"
+eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts"] }
+# Pure-Rust zlib-rs backend makes the Balanced/Best PNG levels ~2.5x faster.
+flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
+global-hotkey = "0.8.0"
+png = "0.18.1"
+rfd = "0.17.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tray-icon = "0.25.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# Keep PNG encoding fast in debug builds too.
+[profile.dev.package."*"]
+opt-level = 3
+
+# Embeds the icon and version info into scr8.exe.
+[target.'cfg(windows)'.build-dependencies]
+png = "0.18.1"
+winresource = "0.1.31"
