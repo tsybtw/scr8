@@ -31,7 +31,7 @@ fn main() {
     let hidden = args.iter().any(|a| a == "--hidden");
     // A manual launch while running shows the existing window; a duplicate
     // autostart just quits.
-    let instance = match single::acquire(!hidden) {
+    let instance = match single::acquire(!hidden, config::is_dev()) {
         single::Instance::Primary(p) => p,
         single::Instance::Secondary => return,
     };

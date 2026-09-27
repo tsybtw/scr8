@@ -181,7 +181,13 @@ impl Overlay {
             );
         }
 
-        let resp = ui.interact(screen, ui.id().with(("screen", idx)), Sense::drag());
+        // Click as well as drag: with drag alone egui hands a press on the
+        // Save button to this full-screen area and starts a new selection.
+        let resp = ui.interact(
+            screen,
+            ui.id().with(("screen", idx)),
+            Sense::click_and_drag(),
+        );
         let pointer = resp.interact_pointer_pos().or(ui.ctx().pointer_hover_pos());
         let local_sel = self
             .sel
@@ -189,10 +195,13 @@ impl Overlay {
 
         // Hover feedback and drag start.
         let hover_kind = pointer.and_then(|p| local_sel.map(|s| edge_hit(s, p)));
+        // A drag only starts once the pointer has moved a little, so decide
+        // what it does from where the button went down.
         if resp.drag_started()
-            && let Some(p) = resp.interact_pointer_pos()
+            && let Some(p) = ui.input(|i| i.pointer.press_origin())
         {
-            self.drag = Some(match (hover_kind, self.sel) {
+            let press_kind = local_sel.map(|s| edge_hit(s, p));
+            self.drag = Some(match (press_kind, self.sel) {
                 (Some(Some(edges)), _) => Drag::Resize(edges.0, edges.1, edges.2, edges.3),
                 (Some(None), Some(s)) if local_sel.unwrap().contains(p) => {
                     Drag::Move(s.min - to_native(p))

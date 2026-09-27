@@ -73,10 +73,10 @@ impl PngLevel {
 
     pub fn hint(self) -> &'static str {
         match self {
-            Self::None => "Fastest save, largest files",
-            Self::Fast => "Near-instant save, good size (recommended)",
-            Self::Balanced => "Slower save, smaller files",
-            Self::Best => "Slowest save, smallest files",
+            Self::None => "About as fast as Fast, but huge files",
+            Self::Fast => "Fast save, medium files (recommended)",
+            Self::Balanced => "Slower save, noticeably smaller files than Fast",
+            Self::Best => "Much slower, files only slightly smaller than Balanced",
         }
     }
 
@@ -109,9 +109,22 @@ impl Default for Config {
     }
 }
 
+/// Where settings live. `SCR8_DATA_DIR` points a development build at a
+/// separate folder so it never touches the real settings.
+pub fn data_dir() -> Option<PathBuf> {
+    match std::env::var_os("SCR8_DATA_DIR") {
+        Some(dir) => Some(dir.into()),
+        None => Some(dirs::config_dir()?.join("scr8")),
+    }
+}
+
+pub fn is_dev() -> bool {
+    std::env::var_os("SCR8_DATA_DIR").is_some()
+}
+
 impl Config {
-    fn path() -> Option<PathBuf> {
-        Some(dirs::config_dir()?.join("scr8").join("config.json"))
+    pub fn path() -> Option<PathBuf> {
+        Some(data_dir()?.join("config.json"))
     }
 
     pub fn load() -> Self {

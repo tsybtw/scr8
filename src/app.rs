@@ -126,7 +126,8 @@ impl App {
             c.request_repaint();
         });
 
-        if cfg.autostart {
+        // A development build must not replace the real autostart entry.
+        if cfg.autostart && !crate::config::is_dev() {
             let _ = autostart::apply(true);
         }
 
@@ -477,18 +478,12 @@ impl App {
     }
 
     fn binds_tab(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if ui.button("➕ New bind").clicked() {
-                let id = self.cfg.new_bind().id;
-                self.save();
-                self.wizard = Some((id, Wizard::Folder));
-                self.start_select(ui.ctx(), id);
-            }
-            ui.label(
-                RichText::new("Area, folder, hotkey. Press the hotkey anywhere to save a PNG.")
-                    .weak(),
-            );
-        });
+        if ui.button("➕ New bind").clicked() {
+            let id = self.cfg.new_bind().id;
+            self.save();
+            self.wizard = Some((id, Wizard::Folder));
+            self.start_select(ui.ctx(), id);
+        }
         ui.add_space(4.0);
 
         if self.cfg.binds.is_empty() {
@@ -565,15 +560,16 @@ impl App {
                                 .show(ui, |ui| {
                                     ui.label("Hotkey");
                                     let text = if recording == Some(Slot::Shot) {
-                                        RichText::new("Press a combination…  (Esc to cancel)")
-                                            .color(orange)
+                                        RichText::new("Press keys…  (Esc cancels)").color(orange)
                                     } else {
                                         match &b.hotkey {
                                             Some(h) => RichText::new(h.label()).strong(),
                                             None => RichText::new("not set").weak(),
                                         }
                                     };
-                                    ui.label(text);
+                                    value_cell(ui, |ui| {
+                                        ui.add(egui::Label::new(text).truncate());
+                                    });
                                     let label = if recording == Some(Slot::Shot) {
                                         "Cancel"
                                     } else if b.hotkey.is_some() {
@@ -587,20 +583,23 @@ impl App {
                                     ui.end_row();
 
                                     ui.label("Area");
-                                    match b.region {
-                                        Some(r) => ui.label(format!(
-                                            "{} × {}  at  {}, {}",
-                                            r.w, r.h, r.x, r.y
-                                        )),
-                                        None => ui.label(RichText::new("not set").weak()),
-                                    };
+                                    value_cell(ui, |ui| {
+                                        let text = match b.region {
+                                            Some(r) => RichText::new(format!(
+                                                "{} × {}  at  {}, {}",
+                                                r.w, r.h, r.x, r.y
+                                            )),
+                                            None => RichText::new("not set").weak(),
+                                        };
+                                        ui.add(egui::Label::new(text).truncate());
+                                    });
                                     ui.horizontal(|ui| {
                                         let label = if b.region.is_some() {
                                             "Edit area"
                                         } else {
                                             "Select area"
                                         };
-                                        if ui.button(label).clicked() {
+                                        if ui.add(first_button(label)).clicked() {
                                             action = Some((id, Action::Select));
                                         }
                                         // Hotkey that opens this editor from anywhere.
@@ -634,14 +633,17 @@ impl App {
                                     ui.end_row();
 
                                     ui.label("Folder");
-                                    match &b.folder {
-                                        Some(f) => ui
-                                            .add(egui::Label::new(short_path(f)).truncate())
-                                            .on_hover_text(f.display().to_string()),
-                                        None => ui.label(RichText::new("not set").weak()),
-                                    };
+                                    value_cell(ui, |ui| match &b.folder {
+                                        Some(f) => {
+                                            ui.add(egui::Label::new(short_path(f)).truncate())
+                                                .on_hover_text(f.display().to_string());
+                                        }
+                                        None => {
+                                            ui.label(RichText::new("not set").weak());
+                                        }
+                                    });
                                     ui.horizontal(|ui| {
-                                        if ui.button("Choose…").clicked() {
+                                        if ui.add(first_button("Choose…")).clicked() {
                                             action = Some((id, Action::Folder));
                                         }
                                         if b.folder.is_some() && ui.button("Open").clicked() {
@@ -699,7 +701,7 @@ impl App {
 
     fn advanced_tab(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         ui.heading("PNG compression");
-        ui.label(RichText::new("Screenshots are always lossless PNG. Compression only trades save speed for file size.").weak());
+        ui.label(RichText::new("Screenshots are always lossless PNG: the level changes only file size and save time. Results depend on the computer and on what's on screen, so check them with the test below.").weak());
         ui.add_space(4.0);
         let mut level = self.cfg.png_level;
         for l in PngLevel::ALL {
@@ -823,7 +825,6 @@ impl App {
                             ui.end_row();
                         }
                     });
-                ui.label(RichText::new("Encoding runs in the background, so even slow levels never drop key presses.").weak());
             }
             Some(Err(e)) => {
                 ui.colored_label(Color32::from_rgb(230, 80, 70), e);
@@ -846,14 +847,11 @@ impl App {
                 Err(e) => self.notice = Some(format!("Autostart: {e}")),
             }
         }
-        if let Some(dir) = dirs::config_dir() {
+        if let Some(path) = Config::path() {
             ui.label(
-                RichText::new(format!(
-                    "Settings file: {}",
-                    dir.join("scr8").join("config.json").display()
-                ))
-                .weak()
-                .small(),
+                RichText::new(format!("Settings file: {}", path.display()))
+                    .weak()
+                    .small(),
             );
         }
     }
@@ -944,6 +942,27 @@ impl eframe::App for App {
         // Keep the "saved" counter fresh while visible.
         ctx.request_repaint_after(Duration::from_millis(500));
     }
+}
+
+/// Middle column of a bind card. A fixed width lines the buttons up across
+/// all cards; long values are cut with an ellipsis.
+fn value_cell(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    const WIDTH: f32 = 190.0;
+    let size = egui::vec2(WIDTH, ui.spacing().interact_size.y);
+    ui.allocate_ui_with_layout(
+        size,
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_width(WIDTH);
+            add(ui);
+        },
+    );
+}
+
+/// Leading button of a bind row; equal widths keep the buttons after it
+/// lined up under each other.
+fn first_button(text: &str) -> egui::Button<'_> {
+    egui::Button::new(text).min_size(egui::vec2(96.0, 0.0))
 }
 
 /// An on/off switch.

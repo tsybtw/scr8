@@ -111,11 +111,16 @@ start with it.
   to dismiss it.
 - **A red message on a bind** means the combination is already used by
   another bind or another app. Click **Change** and pick a different one.
-- **Quality.** Screenshots are always saved as lossless PNG. On the
-  **Advanced** tab you can choose the compression: **Fast** (default) saves
-  quickest with a normal file size, **Best** gives slightly smaller files
-  but is slower. **Run test** shows how long a screenshot takes and how big
-  it is on your computer.
+- **Quality.** Screenshots are always saved as lossless PNG; the
+  compression level on the **Advanced** tab changes only file size and
+  save time:
+  - **Fast** (default): fast save, medium-sized files.
+  - **No compression**: about as fast as Fast, but huge files.
+  - **Balanced**: slower save, noticeably smaller files than Fast.
+  - **Best**: much slower, files only slightly smaller than Balanced.
+
+  The exact numbers depend on your computer and on what's on the screen.
+  **Run test** shows them for your computer.
 
 ## Updating
 
@@ -135,6 +140,9 @@ Download the new version from the links above.
 3. Delete `scr8-windows.exe` (on a Mac, drag scr8 from Applications to the
    Trash).
 
-Settings are kept in `%APPDATA%\scr8` on Windows and in
-`~/Library/Application Support/scr8` on a Mac; you can delete those folders
-too.
+Settings are kept in a `scr8` folder, which you can delete too. The exact
+path is shown at the bottom of the **Advanced** tab:
+
+- Windows: `C:\Users\<your name>\AppData\Roaming\scr8` (you can paste
+  `%APPDATA%\scr8` into the File Explorer address bar to open it)
+- Mac: `~/Library/Application Support/scr8`

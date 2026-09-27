@@ -25,7 +25,11 @@ mod imp {
     // The event handle is only waited on and signalled; both are thread-safe.
     unsafe impl Send for Primary {}
 
-    pub fn acquire(show_existing: bool) -> Instance {
+    pub fn acquire(show_existing: bool, dev: bool) -> Instance {
+        // Development builds run next to the real copy.
+        if dev {
+            return Instance::Primary(Primary(std::ptr::null_mut()));
+        }
         let name: Vec<u16> = NAME.encode_utf16().chain(Some(0)).collect();
         // Auto-reset event: one signal wakes the listener once.
         let h = unsafe { CreateEventW(std::ptr::null(), 0, 0, name.as_ptr()) };
@@ -74,12 +78,13 @@ mod imp {
     pub struct Primary(Option<UnixListener>);
 
     fn socket_path() -> Option<PathBuf> {
-        let dir = dirs::config_dir()?.join("scr8");
+        let dir = crate::config::data_dir()?;
         std::fs::create_dir_all(&dir).ok()?;
         Some(dir.join("instance.sock"))
     }
 
-    pub fn acquire(show_existing: bool) -> Instance {
+    pub fn acquire(show_existing: bool, _dev: bool) -> Instance {
+        // Development builds use their own data dir, hence their own socket.
         let Some(path) = socket_path() else {
             return Instance::Primary(Primary(None));
         };
