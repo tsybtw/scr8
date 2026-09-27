@@ -88,8 +88,10 @@ the combination now saves a screenshot to the chosen folder.
 | --- | --- |
 | **Change** | Set a different key combination |
 | **Edit area** | Change the area |
+| **➕ Edit hotkey** | Set a second combination that opens area editing for this bind from anywhere, without opening the window (✖ removes it) |
 | **Choose…** | Pick a different folder |
 | **Open** | Open the screenshots folder |
+| Switch next to 🗑 | Turn the bind off and on. An off bind keeps all its settings but takes no screenshots, and its combinations are free for other apps |
 | 🗑 | Delete the bind |
 
 Click the bind's name (e.g. "Bind 1") to rename it. Screenshot file names

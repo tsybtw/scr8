@@ -2,12 +2,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::egui::{self, Color32, RichText, ViewportCommand};
-use global_hotkey::GlobalHotKeyManager;
 use global_hotkey::hotkey::HotKey;
+use global_hotkey::{GlobalHotKeyManager, HotKeyState};
 
 use crate::config::{Config, PngLevel, Region};
 use crate::engine::{Engine, Target};
@@ -20,6 +21,35 @@ use crate::{autostart, bench, capture};
 enum Tab {
     Binds,
     Advanced,
+}
+
+/// Which of a bind's two hotkeys is meant.
+#[derive(PartialEq, Clone, Copy)]
+enum Slot {
+    /// Takes the screenshot.
+    Shot,
+    /// Opens area editing.
+    Edit,
+}
+
+/// An area picker running for a bind.
+struct Selecting {
+    id: u64,
+    rx: Receiver<Option<Region>>,
+    /// Show the settings window again afterwards (it was open before).
+    reopen: bool,
+}
+
+/// A button pressed on a bind card, applied after the list is drawn.
+#[derive(Clone, Copy)]
+enum Action {
+    Rename,
+    Toggle,
+    Record(Slot),
+    ClearEdit,
+    Select,
+    Folder,
+    Open,
 }
 
 /// Steps left for a bind that was just created.
@@ -36,8 +66,11 @@ pub struct App {
     registered: Vec<HotKey>,
     bind_errors: HashMap<u64, String>,
     tab: Tab,
-    recording: Option<u64>,
-    selecting: Option<(u64, Receiver<Option<Region>>)>,
+    recording: Option<(u64, Slot)>,
+    selecting: Option<Selecting>,
+    /// Edit-hotkey id -> bind id; read by the hotkey handler.
+    edit_keys: Arc<RwLock<HashMap<u32, u64>>>,
+    edit_rx: Receiver<u64>,
     wizard: Option<(u64, Wizard)>,
     tray: Option<Tray>,
     tray_rx: Receiver<TrayCmd>,
@@ -64,9 +97,24 @@ impl App {
         let cfg = Config::load();
         let c = cc.egui_ctx.clone();
         let (engine, key_tx) = Engine::start(cfg.png_level, move || c.request_repaint());
-        global_hotkey::GlobalHotKeyEvent::set_event_handler(Some(move |e| {
-            let _ = key_tx.send(e);
-        }));
+        // Screenshot hotkeys go straight to the capture thread; edit hotkeys
+        // come here to open the area picker.
+        let edit_keys: Arc<RwLock<HashMap<u32, u64>>> = Arc::default();
+        let (edit_tx, edit_rx) = unbounded();
+        let (keys, c) = (edit_keys.clone(), cc.egui_ctx.clone());
+        global_hotkey::GlobalHotKeyEvent::set_event_handler(Some(
+            move |e: global_hotkey::GlobalHotKeyEvent| match keys.read().unwrap().get(&e.id) {
+                Some(&bind) => {
+                    if e.state == HotKeyState::Pressed {
+                        let _ = edit_tx.send(bind);
+                        c.request_repaint();
+                    }
+                }
+                None => {
+                    let _ = key_tx.send(e);
+                }
+            },
+        ));
         let manager = GlobalHotKeyManager::new().ok();
 
         let (tray_tx, tray_rx): (Sender<TrayCmd>, _) = unbounded();
@@ -96,6 +144,8 @@ impl App {
             tab: Tab::Binds,
             recording: None,
             selecting: None,
+            edit_keys,
+            edit_rx,
             wizard: None,
             tray,
             tray_rx,
@@ -154,7 +204,8 @@ impl App {
         }
     }
 
-    /// Re-registers every complete bind and publishes targets to the engine.
+    /// Re-registers the hotkeys of every enabled bind and publishes the
+    /// screenshot targets to the engine.
     fn sync_hotkeys(&mut self) {
         let Some(manager) = &self.manager else {
             return;
@@ -163,45 +214,58 @@ impl App {
         self.registered.clear();
         self.bind_errors.clear();
         let mut targets = HashMap::new();
+        let mut edits = HashMap::new();
+        let mut used = std::collections::HashSet::new();
         // While recording, keys must reach our window instead of the OS hook.
         if self.recording.is_none() {
-            for b in &self.cfg.binds {
-                let (Some(hk), Some(region), Some(folder)) = (&b.hotkey, b.region, &b.folder)
-                else {
-                    continue;
+            for b in self.cfg.binds.iter().filter(|b| b.enabled) {
+                let mut errors = Vec::new();
+                let mut register = |hk: &Hotkey, what: &str| -> Option<u32> {
+                    let g = hk.to_global()?;
+                    let result = if used.insert(g.id()) {
+                        manager.register(g)
+                    } else {
+                        Err(global_hotkey::Error::AlreadyRegistered(g))
+                    };
+                    match result {
+                        Ok(()) => {
+                            self.registered.push(g);
+                            Some(g.id())
+                        }
+                        Err(global_hotkey::Error::AlreadyRegistered(_)) => {
+                            errors.push(format!("{what} is taken by another bind or app"));
+                            None
+                        }
+                        Err(e) => {
+                            errors.push(format!("Can't register {what}: {e}"));
+                            None
+                        }
+                    }
                 };
-                let Some(g) = hk.to_global() else {
-                    continue;
-                };
-                if targets.contains_key(&g.id()) {
-                    self.bind_errors
-                        .insert(b.id, "Same hotkey as another bind".into());
-                    continue;
+                if let (Some(hk), Some(region), Some(folder)) = (&b.hotkey, b.region, &b.folder)
+                    && let Some(id) = register(hk, "Hotkey")
+                {
+                    targets.insert(
+                        id,
+                        Target {
+                            name: b.name.clone(),
+                            region,
+                            folder: folder.clone(),
+                        },
+                    );
                 }
-                match manager.register(g) {
-                    Ok(()) => {
-                        self.registered.push(g);
-                        targets.insert(
-                            g.id(),
-                            Target {
-                                name: b.name.clone(),
-                                region,
-                                folder: folder.clone(),
-                            },
-                        );
-                    }
-                    Err(global_hotkey::Error::AlreadyRegistered(_)) => {
-                        self.bind_errors
-                            .insert(b.id, "This hotkey is taken by another app".into());
-                    }
-                    Err(e) => {
-                        self.bind_errors
-                            .insert(b.id, format!("Can't register hotkey: {e}"));
-                    }
+                if let Some(hk) = &b.edit_hotkey
+                    && let Some(id) = register(hk, "Edit hotkey")
+                {
+                    edits.insert(id, b.id);
+                }
+                if !errors.is_empty() {
+                    self.bind_errors.insert(b.id, errors.join(". "));
                 }
             }
         }
         *self.engine.targets.write().unwrap() = targets;
+        *self.edit_keys.write().unwrap() = edits;
     }
 
     fn show_window(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
@@ -225,14 +289,21 @@ impl App {
         let Ok(exe) = std::env::current_exe() else {
             return;
         };
-        self.recording = None;
+        if self.recording.is_some() {
+            self.stop_recording();
+        }
         let initial = self.bind(id).and_then(|b| b.region);
-        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+        let reopen = ctx.input(|i| i.viewport().visible()).unwrap_or(false);
+        if reopen {
+            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+        }
         let (tx, rx) = unbounded();
         let c = ctx.clone();
         std::thread::spawn(move || {
             // Let the window fade out so it isn't in the frozen screenshot.
-            std::thread::sleep(Duration::from_millis(250));
+            if reopen {
+                std::thread::sleep(Duration::from_millis(250));
+            }
             let mut cmd = Command::new(exe);
             cmd.arg("--select");
             if let Some(r) = initial {
@@ -248,7 +319,7 @@ impl App {
             let _ = tx.send(region);
             c.request_repaint();
         });
-        self.selecting = Some((id, rx));
+        self.selecting = Some(Selecting { id, rx, reopen });
     }
 
     fn pick_folder(&mut self, id: u64) {
@@ -267,8 +338,8 @@ impl App {
         }
     }
 
-    fn start_recording(&mut self, id: u64) {
-        self.recording = Some(id);
+    fn start_recording(&mut self, id: u64, slot: Slot) {
+        self.recording = Some((id, slot));
         self.sync_hotkeys();
     }
 
@@ -286,7 +357,7 @@ impl App {
     }
 
     fn handle_recording(&mut self, ctx: &egui::Context) {
-        let Some(id) = self.recording else {
+        let Some((id, slot)) = self.recording else {
             return;
         };
         let presses: Vec<(egui::Key, egui::Modifiers)> = ctx.input(|i| {
@@ -311,18 +382,23 @@ impl App {
                 return;
             }
             if let Some(hk) = Hotkey::from_press(key, mods) {
-                let dup = self
-                    .cfg
-                    .binds
-                    .iter()
-                    .find(|b| b.id != id && b.hotkey.as_ref() == Some(&hk))
-                    .map(|b| b.name.clone());
+                // Every hotkey of every bind must be unique.
+                let dup = self.cfg.binds.iter().find_map(|b| {
+                    let clash = |s: Slot, h: &Option<Hotkey>| {
+                        (b.id, s) != (id, slot) && h.as_ref() == Some(&hk)
+                    };
+                    (clash(Slot::Shot, &b.hotkey) || clash(Slot::Edit, &b.edit_hotkey))
+                        .then(|| b.name.clone())
+                });
                 if let Some(other) = dup {
                     self.notice = Some(format!("{} is already used by \"{other}\"", hk.label()));
                     continue;
                 }
                 if let Some(b) = self.bind_mut(id) {
-                    b.hotkey = Some(hk);
+                    match slot {
+                        Slot::Shot => b.hotkey = Some(hk),
+                        Slot::Edit => b.edit_hotkey = Some(hk),
+                    }
                 }
                 self.notice = None;
                 self.save();
@@ -344,12 +420,21 @@ impl App {
             }
         }
 
-        if let Some((id, rx)) = &self.selecting
-            && let Ok(result) = rx.try_recv()
+        while let Ok(id) = self.edit_rx.try_recv() {
+            let enabled = self.bind(id).is_some_and(|b| b.enabled);
+            if enabled && self.selecting.is_none() && self.recording.is_none() {
+                self.start_select(ctx, id);
+            }
+        }
+
+        if let Some(sel) = &self.selecting
+            && let Ok(result) = sel.rx.try_recv()
         {
-            let id = *id;
+            let (id, reopen) = (sel.id, sel.reopen);
             self.selecting = None;
-            self.show_window(ctx, frame);
+            if reopen {
+                self.show_window(ctx, frame);
+            }
             match result {
                 Some(region) => {
                     if let Some(b) = self.bind_mut(id) {
@@ -416,13 +501,14 @@ impl App {
         }
 
         let mut delete = None;
-        let mut action: Option<(u64, &'static str)> = None;
+        let mut action: Option<(u64, Action)> = None;
+        let orange = Color32::from_rgb(255, 170, 40);
         egui::ScrollArea::vertical()
             .auto_shrink(false)
             .show(ui, |ui| {
                 let ids: Vec<u64> = self.cfg.binds.iter().map(|b| b.id).collect();
                 for id in ids {
-                    let recording = self.recording == Some(id);
+                    let recording = self.recording.filter(|r| r.0 == id).map(|r| r.1);
                     let error = self.bind_errors.get(&id).cloned();
                     let Some(b) = self.cfg.binds.iter_mut().find(|b| b.id == id) else {
                         continue;
@@ -439,7 +525,7 @@ impl App {
                                         .font(egui::TextStyle::Heading),
                                 );
                                 if name.lost_focus() {
-                                    action = Some((id, "rename"));
+                                    action = Some((id, Action::Rename));
                                 }
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
@@ -448,30 +534,39 @@ impl App {
                                         {
                                             delete = Some(id);
                                         }
+                                        if toggle(ui, &mut b.enabled)
+                                            .on_hover_text("Turn this bind on or off")
+                                            .changed()
+                                        {
+                                            action = Some((id, Action::Toggle));
+                                        }
                                         let ready = b.hotkey.is_some()
                                             && b.region.is_some()
                                             && b.folder.is_some();
-                                        if error.is_none() && ready {
-                                            let green = Color32::from_rgb(60, 180, 90);
-                                            ui.label(RichText::new("active").color(green));
-                                            // Painted: the default font has no bullet glyph.
-                                            let (dot, _) = ui.allocate_exact_size(
-                                                egui::vec2(8.0, 8.0),
-                                                egui::Sense::hover(),
+                                        if !b.enabled {
+                                            ui.label(RichText::new("off").weak());
+                                        } else if error.is_none() && ready {
+                                            status_dot(
+                                                ui,
+                                                "active",
+                                                Color32::from_rgb(60, 180, 90),
                                             );
-                                            ui.painter().circle_filled(dot.center(), 4.0, green);
                                         }
                                     },
                                 );
                             });
+                            // Dim the settings of a disabled bind; they stay editable.
+                            if !b.enabled {
+                                ui.multiply_opacity(0.55);
+                            }
                             egui::Grid::new(("grid", id))
                                 .num_columns(3)
                                 .spacing([12.0, 6.0])
                                 .show(ui, |ui| {
                                     ui.label("Hotkey");
-                                    let text = if recording {
+                                    let text = if recording == Some(Slot::Shot) {
                                         RichText::new("Press a combination…  (Esc to cancel)")
-                                            .color(Color32::from_rgb(255, 170, 40))
+                                            .color(orange)
                                     } else {
                                         match &b.hotkey {
                                             Some(h) => RichText::new(h.label()).strong(),
@@ -479,7 +574,7 @@ impl App {
                                         }
                                     };
                                     ui.label(text);
-                                    let label = if recording {
+                                    let label = if recording == Some(Slot::Shot) {
                                         "Cancel"
                                     } else if b.hotkey.is_some() {
                                         "Change"
@@ -487,10 +582,7 @@ impl App {
                                         "Set hotkey"
                                     };
                                     if ui.button(label).clicked() {
-                                        action = Some((
-                                            id,
-                                            if recording { "stop_rec" } else { "record" },
-                                        ));
+                                        action = Some((id, Action::Record(Slot::Shot)));
                                     }
                                     ui.end_row();
 
@@ -502,14 +594,43 @@ impl App {
                                         )),
                                         None => ui.label(RichText::new("not set").weak()),
                                     };
-                                    let label = if b.region.is_some() {
-                                        "Edit area"
-                                    } else {
-                                        "Select area"
-                                    };
-                                    if ui.button(label).clicked() {
-                                        action = Some((id, "select"));
-                                    }
+                                    ui.horizontal(|ui| {
+                                        let label = if b.region.is_some() {
+                                            "Edit area"
+                                        } else {
+                                            "Select area"
+                                        };
+                                        if ui.button(label).clicked() {
+                                            action = Some((id, Action::Select));
+                                        }
+                                        // Hotkey that opens this editor from anywhere.
+                                        let edit = if recording == Some(Slot::Edit) {
+                                            RichText::new("Press keys…  (Esc)").color(orange)
+                                        } else {
+                                            match &b.edit_hotkey {
+                                                Some(h) => RichText::new(h.label()),
+                                                None => RichText::new("➕ Edit hotkey"),
+                                            }
+                                        };
+                                        if ui
+                                            .button(edit)
+                                            .on_hover_text(
+                                                "Hotkey that opens area editing for this bind",
+                                            )
+                                            .clicked()
+                                        {
+                                            action = Some((id, Action::Record(Slot::Edit)));
+                                        }
+                                        if b.edit_hotkey.is_some()
+                                            && recording != Some(Slot::Edit)
+                                            && ui
+                                                .small_button("✖")
+                                                .on_hover_text("Remove edit hotkey")
+                                                .clicked()
+                                        {
+                                            action = Some((id, Action::ClearEdit));
+                                        }
+                                    });
                                     ui.end_row();
 
                                     ui.label("Folder");
@@ -521,10 +642,10 @@ impl App {
                                     };
                                     ui.horizontal(|ui| {
                                         if ui.button("Choose…").clicked() {
-                                            action = Some((id, "folder"));
+                                            action = Some((id, Action::Folder));
                                         }
                                         if b.folder.is_some() && ui.button("Open").clicked() {
-                                            action = Some((id, "open"));
+                                            action = Some((id, Action::Open));
                                         }
                                     });
                                     ui.end_row();
@@ -539,7 +660,7 @@ impl App {
 
         if let Some(id) = delete {
             self.cfg.binds.retain(|b| b.id != id);
-            if self.recording == Some(id) {
+            if self.recording.is_some_and(|r| r.0 == id) {
                 self.recording = None;
             }
             self.save();
@@ -547,20 +668,31 @@ impl App {
         }
         if let Some((id, what)) = action {
             match what {
-                "rename" => {
+                Action::Rename | Action::Toggle => {
                     self.save();
                     self.sync_hotkeys();
                 }
-                "record" => self.start_recording(id),
-                "stop_rec" => self.stop_recording(),
-                "select" => self.start_select(ui.ctx(), id),
-                "folder" => self.pick_folder(id),
-                "open" => {
+                Action::Record(slot) => {
+                    if self.recording == Some((id, slot)) {
+                        self.stop_recording();
+                    } else {
+                        self.start_recording(id, slot);
+                    }
+                }
+                Action::ClearEdit => {
+                    if let Some(b) = self.bind_mut(id) {
+                        b.edit_hotkey = None;
+                    }
+                    self.save();
+                    self.sync_hotkeys();
+                }
+                Action::Select => self.start_select(ui.ctx(), id),
+                Action::Folder => self.pick_folder(id),
+                Action::Open => {
                     if let Some(f) = self.bind(id).and_then(|b| b.folder.clone()) {
                         open_folder(&f);
                     }
                 }
-                _ => {}
             }
         }
     }
@@ -756,7 +888,7 @@ impl eframe::App for App {
         {
             self.wizard = None;
             if self.bind(id).is_some_and(|b| b.hotkey.is_none()) {
-                self.start_recording(id);
+                self.start_recording(id, Slot::Shot);
             }
         }
 
@@ -812,6 +944,41 @@ impl eframe::App for App {
         // Keep the "saved" counter fresh while visible.
         ctx.request_repaint_after(Duration::from_millis(500));
     }
+}
+
+/// An on/off switch.
+fn toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
+    let size = egui::vec2(2.0, 1.0) * ui.spacing().interact_size.y;
+    let (rect, mut resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    if ui.is_rect_visible(rect) {
+        let t = ui.ctx().animate_bool_responsive(resp.id, *on);
+        let visuals = ui.style().interact_selectable(&resp, *on);
+        let rect = rect.expand(visuals.expansion);
+        let radius = 0.5 * rect.height();
+        ui.painter().rect(
+            rect,
+            radius,
+            visuals.bg_fill,
+            visuals.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+        let x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), t);
+        let knob = egui::pos2(x, rect.center().y);
+        ui.painter()
+            .circle(knob, 0.75 * radius, visuals.bg_fill, visuals.fg_stroke);
+    }
+    resp
+}
+
+/// A colored dot followed by a label (the default font has no bullet glyph).
+fn status_dot(ui: &mut egui::Ui, text: &str, color: Color32) {
+    ui.label(RichText::new(text).color(color));
+    let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+    ui.painter().circle_filled(dot.center(), 4.0, color);
 }
 
 fn short_path(p: &std::path::Path) -> String {

@@ -38,6 +38,16 @@ pub struct Bind {
     pub hotkey: Option<Hotkey>,
     pub region: Option<Region>,
     pub folder: Option<PathBuf>,
+    /// A disabled bind keeps its settings but registers no hotkeys.
+    #[serde(default = "enabled_default")]
+    pub enabled: bool,
+    /// Opens area editing for this bind from anywhere.
+    #[serde(default)]
+    pub edit_hotkey: Option<Hotkey>,
+}
+
+fn enabled_default() -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -135,6 +145,8 @@ impl Config {
             hotkey: None,
             region: None,
             folder: None,
+            enabled: true,
+            edit_hotkey: None,
         });
         self.binds.last_mut().unwrap()
     }
