@@ -8,16 +8,32 @@ mod config;
 mod engine;
 mod hotkey;
 mod icon;
+mod look;
+#[cfg(not(windows))]
 mod overlay;
+#[cfg(windows)]
+mod overlay_win;
+mod render;
 mod single;
 mod tray;
 
 use eframe::egui;
 
 fn main() {
+    render::install_panic_hook();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("--select") {
-        overlay::run(args.get(1).and_then(|a| config::Region::parse(a)));
+        // The area picker on its own: prints the chosen area to stdout.
+        // macOS runs it this way; on Windows the app shows it in-process and
+        // this entry point is kept for testing.
+        let initial = args.get(1).and_then(|a| config::Region::parse(a));
+        #[cfg(not(windows))]
+        overlay::run(initial);
+        #[cfg(windows)]
+        match overlay_win::pick(initial) {
+            Some(r) => println!("{}", r.to_arg()),
+            None => std::process::exit(1),
+        }
         return;
     }
     if args.first().map(String::as_str) == Some("--write-icon") {
@@ -56,10 +72,13 @@ fn main() {
         viewport,
         ..Default::default()
     };
-    let _ = eframe::run_native(
+    render::run(
         "scr8",
         options,
-        Box::new(|cc| Ok(Box::new(app::App::new(cc, hidden, instance)))),
+        Box::new(|cc| {
+            render::mark_started();
+            Ok(Box::new(app::App::new(cc, hidden, instance)))
+        }),
     );
 }
 

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -287,9 +287,6 @@ impl App {
 
     /// Hides the settings window and runs the picker as a child process.
     fn start_select(&mut self, ctx: &egui::Context, id: u64) {
-        let Ok(exe) = std::env::current_exe() else {
-            return;
-        };
         if self.recording.is_some() {
             self.stop_recording();
         }
@@ -305,19 +302,7 @@ impl App {
             if reopen {
                 std::thread::sleep(Duration::from_millis(250));
             }
-            let mut cmd = Command::new(exe);
-            cmd.arg("--select");
-            if let Some(r) = initial {
-                cmd.arg(r.to_arg());
-            }
-            let region = cmd
-                .stdin(Stdio::null())
-                .stderr(Stdio::null())
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .and_then(|o| Region::parse(String::from_utf8_lossy(&o.stdout).trim()));
-            let _ = tx.send(region);
+            let _ = tx.send(pick_area(initial));
             c.request_repaint();
         });
         self.selecting = Some(Selecting { id, rx, reopen });
@@ -998,6 +983,30 @@ fn status_dot(ui: &mut egui::Ui, text: &str, color: Color32) {
     ui.label(RichText::new(text).color(color));
     let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
     ui.painter().circle_filled(dot.center(), 4.0, color);
+}
+
+/// Shows the area picker and waits for the result.
+/// Windows draws it right here with GDI; macOS runs it as a child process.
+fn pick_area(initial: Option<Region>) -> Option<Region> {
+    #[cfg(windows)]
+    {
+        crate::overlay_win::pick(initial)
+    }
+    #[cfg(not(windows))]
+    {
+        let exe = std::env::current_exe().ok()?;
+        let mut cmd = Command::new(exe);
+        cmd.arg("--select");
+        if let Some(r) = initial {
+            cmd.arg(r.to_arg());
+        }
+        cmd.stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| Region::parse(String::from_utf8_lossy(&o.stdout).trim()))
+    }
 }
 
 fn short_path(p: &std::path::Path) -> String {

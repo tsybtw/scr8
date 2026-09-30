@@ -1,31 +1,33 @@
-//! Full-screen area picker. Runs as a short-lived child process
-//! (`scr8 --select [x,y,w,h]`) that prints the chosen region to stdout, so the
-//! main app never has to juggle full-screen window state.
+//! Full-screen area picker for macOS, drawn with egui. Runs as a short-lived
+//! child process (`scr8 --select [x,y,w,h]`) that prints the chosen region to
+//! stdout, so the main app never has to juggle full-screen window state.
+//! Windows uses the GDI picker in `overlay_win`; both follow `look`.
 
 use eframe::egui::{
-    self, Align2, Color32, ColorImage, CursorIcon, FontId, Key, Pos2, Rect, Sense, Stroke,
-    StrokeKind, TextureHandle, TextureOptions, Vec2, ViewportBuilder, ViewportId, WindowLevel,
+    self, Color32, ColorImage, CursorIcon, FontId, Key, Pos2, Rect, Sense, Stroke, StrokeKind,
+    TextureHandle, TextureOptions, Vec2, ViewportBuilder, ViewportId, WindowLevel,
 };
 
 use crate::capture;
 use crate::config::Region;
+use crate::look;
 
-const ACCENT: Color32 = Color32::from_rgb(64, 156, 255);
-const HANDLE: f32 = 8.0;
+const ACCENT: Color32 = Color32::from_rgb(look::ACCENT.0, look::ACCENT.1, look::ACCENT.2);
+const HANDLE: f32 = look::HANDLE;
 
 pub fn run(initial: Option<Region>) {
     let options = eframe::NativeOptions {
         viewport: overlay_builder().with_title("scr8 — select area"),
         ..Default::default()
     };
-    let result = eframe::run_native(
+    crate::render::run(
         "scr8-select",
         options,
-        Box::new(move |_cc| Ok(Box::new(Overlay::new(initial)))),
+        Box::new(move |_cc| {
+            crate::render::mark_started();
+            Ok(Box::new(Overlay::new(initial)))
+        }),
     );
-    if let Err(e) = result {
-        eprintln!("overlay failed: {e}");
-    }
     // Window closed without a choice.
     std::process::exit(1);
 }
@@ -53,7 +55,12 @@ struct Monitor {
     placed: bool,
     /// Placement tries so far; gives up eventually rather than loop forever.
     attempts: u32,
+    /// Frames drawn since the window was placed; the first ones may still go
+    /// to a surface of the old size and show up stretched and blurry.
+    settled_frames: u8,
     tex: Option<TextureHandle>,
+    /// Where the Save/Esc buttons were last drawn, in window points.
+    bar: Option<Rect>,
 }
 
 #[derive(Clone, Copy)]
@@ -69,6 +76,10 @@ struct Overlay {
     /// Selection in native global coordinates.
     sel: Option<Rect>,
     drag: Option<Drag>,
+    /// Where the primary button went down (window points), until released.
+    press: Option<Pos2>,
+    /// The Save/Esc panel as last laid out.
+    panel: Option<Rect>,
     ready: bool,
 }
 
@@ -83,7 +94,38 @@ impl Overlay {
                 )
             }),
             drag: None,
+            press: None,
+            panel: None,
             ready: false,
+        }
+    }
+
+    /// Moves the part of the selection a drag holds to native point `n`.
+    fn apply_drag(&mut self, d: Drag, n: Pos2) {
+        match d {
+            Drag::New(start) => self.sel = Some(Rect::from_two_pos(start, n)),
+            Drag::Move(off) => {
+                if let Some(s) = self.sel.as_mut() {
+                    *s = Rect::from_min_size(n + off, s.size());
+                }
+            }
+            Drag::Resize(l, t, r, b) => {
+                if let Some(s) = self.sel.as_mut() {
+                    if l {
+                        s.min.x = n.x;
+                    }
+                    if t {
+                        s.min.y = n.y;
+                    }
+                    if r {
+                        s.max.x = n.x;
+                    }
+                    if b {
+                        s.max.y = n.y;
+                    }
+                    *s = Rect::from_two_pos(s.min, s.max);
+                }
+            }
         }
     }
 
@@ -128,7 +170,9 @@ impl Overlay {
                 ),
                 placed: false,
                 attempts: 0,
+                settled_frames: 0,
                 tex,
+                bar: None,
             });
         }
     }
@@ -149,9 +193,24 @@ impl Overlay {
     /// Draws one monitor's view and handles its input.
     fn monitor_ui(&mut self, ui: &mut egui::Ui, idx: usize) {
         let screen = ui.max_rect();
-        let Some(m) = self.monitors.get(idx) else {
+        let Some(m) = self.monitors.get_mut(idx) else {
             return;
         };
+        // Until the window covers its monitor and has settled at that size,
+        // the frozen screen would show up scaled wrong or blurry (for a
+        // second or so with software rendering), so show plain black.
+        if !m.placed || m.settled_frames < 2 {
+            if m.placed {
+                m.settled_frames += 1;
+            }
+            ui.painter().rect_filled(screen, 0.0, Color32::BLACK);
+            ui.ctx().request_repaint();
+            if ui.input(|i| i.key_pressed(Key::Escape)) {
+                std::process::exit(1);
+            }
+            return;
+        }
+        let m = &self.monitors[idx];
         // Map through the window's real position so an off-by-one placement
         // (e.g. an invisible border) never shifts the chosen area.
         // Native units are physical px on Windows and points on macOS.
@@ -181,73 +240,67 @@ impl Overlay {
             );
         }
 
-        // Click as well as drag: with drag alone egui hands a press on the
-        // Save button to this full-screen area and starts a new selection.
-        let resp = ui.interact(
-            screen,
-            ui.id().with(("screen", idx)),
-            Sense::click_and_drag(),
-        );
-        let pointer = resp.interact_pointer_pos().or(ui.ctx().pointer_hover_pos());
-        let local_sel = self
-            .sel
-            .map(|s| Rect::from_min_max(to_local(s.min), to_local(s.max)));
+        // Clicks only: the Save button on top takes its own clicks, and a
+        // double-click inside the selection saves it.
+        let resp = ui.interact(screen, ui.id().with(("screen", idx)), Sense::click());
+        let local_sel =
+            |sel: Option<Rect>| sel.map(|s| Rect::from_min_max(to_local(s.min), to_local(s.max)));
 
-        // Hover feedback and drag start.
+        // Selection dragging reads raw pointer events instead of egui's
+        // per-frame drag state, so a press, moves and release that all land
+        // in one slow frame (software rendering) still count.
+        let bar = self.monitors[idx].bar;
+        for ev in ui.input(|i| i.events.clone()) {
+            match ev {
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    ..
+                } => {
+                    if pressed {
+                        self.press = (!bar.is_some_and(|b| b.contains(pos))).then_some(pos);
+                    } else {
+                        if let Some(d) = self.drag.take() {
+                            self.apply_drag(d, to_native(pos));
+                            if self
+                                .sel
+                                .is_some_and(|s| s.width() < 3.0 || s.height() < 3.0)
+                            {
+                                self.sel = None;
+                            }
+                        }
+                        self.press = None;
+                    }
+                }
+                egui::Event::PointerMoved(pos) => {
+                    if let Some(start) = self.press
+                        && self.drag.is_none()
+                        && start.distance(pos) > 4.0
+                    {
+                        // Decide what the drag does from where the button went down.
+                        let sel_local = local_sel(self.sel);
+                        self.drag = Some(match (sel_local.map(|s| edge_hit(s, start)), self.sel) {
+                            (Some(Some(edges)), _) => {
+                                Drag::Resize(edges.0, edges.1, edges.2, edges.3)
+                            }
+                            (Some(None), Some(s)) if sel_local.unwrap().contains(start) => {
+                                Drag::Move(s.min - to_native(start))
+                            }
+                            _ => Drag::New(to_native(start)),
+                        });
+                    }
+                    if let Some(d) = self.drag {
+                        self.apply_drag(d, to_native(pos));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let pointer = ui.ctx().pointer_hover_pos();
+        let local_sel = local_sel(self.sel);
         let hover_kind = pointer.and_then(|p| local_sel.map(|s| edge_hit(s, p)));
-        // A drag only starts once the pointer has moved a little, so decide
-        // what it does from where the button went down.
-        if resp.drag_started()
-            && let Some(p) = ui.input(|i| i.pointer.press_origin())
-        {
-            let press_kind = local_sel.map(|s| edge_hit(s, p));
-            self.drag = Some(match (press_kind, self.sel) {
-                (Some(Some(edges)), _) => Drag::Resize(edges.0, edges.1, edges.2, edges.3),
-                (Some(None), Some(s)) if local_sel.unwrap().contains(p) => {
-                    Drag::Move(s.min - to_native(p))
-                }
-                _ => Drag::New(to_native(p)),
-            });
-        }
-        if resp.dragged()
-            && let (Some(d), Some(p)) = (self.drag, resp.interact_pointer_pos())
-        {
-            let n = to_native(p);
-            match d {
-                Drag::New(start) => self.sel = Some(Rect::from_two_pos(start, n)),
-                Drag::Move(off) => {
-                    if let Some(s) = self.sel.as_mut() {
-                        *s = Rect::from_min_size(n + off, s.size());
-                    }
-                }
-                Drag::Resize(l, t, r, b) => {
-                    if let Some(s) = self.sel.as_mut() {
-                        if l {
-                            s.min.x = n.x;
-                        }
-                        if t {
-                            s.min.y = n.y;
-                        }
-                        if r {
-                            s.max.x = n.x;
-                        }
-                        if b {
-                            s.max.y = n.y;
-                        }
-                        *s = Rect::from_two_pos(s.min, s.max);
-                    }
-                }
-            }
-        }
-        if resp.drag_stopped() {
-            self.drag = None;
-            if self
-                .sel
-                .is_some_and(|s| s.width() < 3.0 || s.height() < 3.0)
-            {
-                self.sel = None;
-            }
-        }
         if resp.double_clicked()
             && local_sel
                 .is_some_and(|s| s.contains(resp.interact_pointer_pos().unwrap_or_default()))
@@ -268,7 +321,7 @@ impl Overlay {
         ui.ctx().set_cursor_icon(cursor);
 
         // Dim everything outside the selection.
-        let dim = Color32::from_black_alpha(140);
+        let dim = Color32::from_black_alpha(look::DIM_ALPHA);
         let sel = self
             .sel
             .map(|s| Rect::from_min_max(to_local(s.min), to_local(s.max)));
@@ -295,59 +348,53 @@ impl Overlay {
         }
 
         if let Some(s) = sel {
-            painter.rect_stroke(s, 0.0, Stroke::new(1.5, ACCENT), StrokeKind::Outside);
+            painter.rect_stroke(
+                s,
+                0.0,
+                Stroke::new(look::BORDER, ACCENT),
+                StrokeKind::Outside,
+            );
             for c in [
                 s.left_top(),
                 s.right_top(),
                 s.left_bottom(),
                 s.right_bottom(),
             ] {
-                painter.rect_filled(Rect::from_center_size(c, Vec2::splat(HANDLE)), 1.0, ACCENT);
+                painter.rect_filled(
+                    Rect::from_center_size(c, Vec2::splat(look::HANDLE)),
+                    1.0,
+                    ACCENT,
+                );
             }
             let native = self.sel.unwrap();
             let label = format!("{} × {}", native.width().round(), native.height().round());
-            let above = s.min.y - 24.0 > screen.min.y;
+            let galley = badge_galley(&painter, &label);
+            let size = galley.size() + 2.0 * Vec2::from(look::BADGE_PAD);
+            let above = s.min.y - look::BADGE_GAP - size.y >= screen.min.y;
             let at = if above {
-                s.left_top() - Vec2::new(0.0, 6.0)
+                Pos2::new(s.min.x, s.min.y - look::BADGE_GAP - size.y)
             } else {
-                s.left_top() + Vec2::new(6.0, 6.0)
+                s.min + Vec2::splat(look::BADGE_GAP)
             };
-            let anchor = if above {
-                Align2::LEFT_BOTTOM
-            } else {
-                Align2::LEFT_TOP
-            };
-            text_badge(&painter, at, anchor, &label);
+            draw_badge(&painter, Rect::from_min_size(at, size), galley);
 
+            self.monitors[idx].bar = None;
             if self.drag.is_none() && screen.intersects(s) {
-                let below = s.max.y + 44.0 < screen.max.y;
-                let y = if below { s.max.y + 8.0 } else { s.max.y - 44.0 };
-                let x = s.max.x.min(screen.max.x - 8.0).max(screen.min.x + 190.0);
-                let bar = Rect::from_min_size(Pos2::new(x - 182.0, y), Vec2::new(182.0, 34.0));
-                let mut done = false;
-                let mut cancel = false;
-                ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
-                    egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            done = ui.button("✔ Save  (Enter)").clicked();
-                            cancel = ui.button("✖ Esc").clicked();
-                        });
-                    });
-                });
-                if done {
-                    self.finish();
+                match self.buttons(ui, screen, s) {
+                    Some(true) => self.finish(),
+                    Some(false) => std::process::exit(1),
+                    None => {}
                 }
-                if cancel {
-                    std::process::exit(1);
-                }
+                self.monitors[idx].bar = self.panel;
             }
         } else {
-            text_badge(
-                &painter,
-                screen.center_top() + Vec2::new(0.0, 40.0),
-                Align2::CENTER_TOP,
-                "Drag to select an area  ·  Enter to save  ·  Esc to cancel",
+            let galley = badge_galley(&painter, look::HINT);
+            let size = galley.size() + 2.0 * Vec2::from(look::BADGE_PAD);
+            let at = Pos2::new(
+                screen.center().x - size.x / 2.0,
+                screen.min.y + look::HINT_TOP,
             );
+            draw_badge(&painter, Rect::from_min_size(at, size), galley);
         }
 
         let (enter, esc) = ui.input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
@@ -477,10 +524,100 @@ fn resize_cursor(l: bool, t: bool, r: bool, b: bool) -> CursorIcon {
     }
 }
 
-fn text_badge(painter: &egui::Painter, at: Pos2, anchor: Align2, text: &str) {
-    let galley =
-        painter.layout_no_wrap(text.to_owned(), FontId::proportional(14.0), Color32::WHITE);
-    let rect = anchor.anchor_size(at, galley.size() + Vec2::new(12.0, 6.0));
-    painter.rect_filled(rect, 4.0, Color32::from_black_alpha(200));
-    painter.galley(rect.min + Vec2::new(6.0, 3.0), galley, Color32::WHITE);
+fn color(c: look::Rgb) -> Color32 {
+    Color32::from_rgb(c.0, c.1, c.2)
+}
+
+fn badge_galley(painter: &egui::Painter, text: &str) -> std::sync::Arc<egui::Galley> {
+    painter.layout_no_wrap(
+        text.to_owned(),
+        FontId::proportional(look::BADGE_FONT),
+        Color32::WHITE,
+    )
+}
+
+/// Size label / hint: white text on translucent black.
+fn draw_badge(painter: &egui::Painter, rect: Rect, galley: std::sync::Arc<egui::Galley>) {
+    painter.rect_filled(
+        rect,
+        look::BADGE_RADIUS,
+        Color32::from_black_alpha(look::BADGE_ALPHA),
+    );
+    painter.galley(
+        rect.min + Vec2::from(look::BADGE_PAD),
+        galley,
+        Color32::WHITE,
+    );
+}
+
+impl Overlay {
+    /// Draws the Save / Esc panel under the selection (same layout as the
+    /// Windows picker). Returns `Some(true)` for Save, `Some(false)` for Esc.
+    fn buttons(&mut self, ui: &mut egui::Ui, screen: Rect, s: Rect) -> Option<bool> {
+        let painter = ui.painter().clone();
+        let font = FontId::proportional(look::BUTTON_FONT);
+        let pad = Vec2::from(look::BUTTON_PAD);
+        let label = |icon: &str, text: &str| {
+            painter.layout_no_wrap(format!("{icon} {text}"), font.clone(), Color32::WHITE)
+        };
+        let save = label(look::SAVE_ICON, look::SAVE_LABEL);
+        let cancel = label(look::CANCEL_ICON, look::CANCEL_LABEL);
+        let btn_h = save.size().y + 2.0 * pad.y;
+        let save_w = save.size().x + 2.0 * pad.x;
+        let cancel_w = cancel.size().x + 2.0 * pad.x;
+        let panel_size = Vec2::new(
+            2.0 * look::PANEL_PAD + save_w + look::BUTTON_GAP + cancel_w,
+            2.0 * look::PANEL_PAD + btn_h,
+        );
+        let y = if s.max.y + look::PANEL_GAP + panel_size.y <= screen.max.y {
+            s.max.y + look::PANEL_GAP
+        } else {
+            s.max.y - look::PANEL_GAP - panel_size.y
+        };
+        let right = s
+            .max
+            .x
+            .min(screen.max.x - look::PANEL_GAP)
+            .max(screen.min.x + panel_size.x + look::PANEL_GAP);
+        let panel = Rect::from_min_size(Pos2::new(right - panel_size.x, y), panel_size);
+        self.panel = Some(panel);
+
+        // Soft drop shadow, then border and fill.
+        painter.rect_filled(
+            panel.translate(Vec2::new(3.0, 5.0)).expand(2.0),
+            look::PANEL_RADIUS + 2.0,
+            Color32::from_black_alpha(45),
+        );
+        painter.rect_filled(panel, look::PANEL_RADIUS, color(look::PANEL_STROKE));
+        painter.rect_filled(
+            panel.shrink(1.0),
+            look::PANEL_RADIUS - 1.0,
+            color(look::PANEL_FILL),
+        );
+
+        let save_rect = Rect::from_min_size(
+            panel.min + Vec2::splat(look::PANEL_PAD),
+            Vec2::new(save_w, btn_h),
+        );
+        let cancel_rect = Rect::from_min_size(
+            Pos2::new(save_rect.max.x + look::BUTTON_GAP, save_rect.min.y),
+            Vec2::new(cancel_w, btn_h),
+        );
+        let mut clicked = None;
+        for (rect, galley, is_save) in [(save_rect, save, true), (cancel_rect, cancel, false)] {
+            let resp = ui.interact(rect, ui.id().with(("button", is_save)), Sense::click());
+            let (bg, fg) = if resp.hovered() {
+                (look::BUTTON_FILL_HOVER, look::BUTTON_TEXT_HOVER)
+            } else {
+                (look::BUTTON_FILL, look::BUTTON_TEXT)
+            };
+            painter.rect_filled(rect, look::BUTTON_RADIUS, color(bg));
+            let pos = Pos2::new(rect.min.x + pad.x, rect.center().y - galley.size().y / 2.0);
+            painter.galley(pos, galley, color(fg));
+            if resp.clicked() {
+                clicked = Some(is_save);
+            }
+        }
+        clicked
+    }
 }

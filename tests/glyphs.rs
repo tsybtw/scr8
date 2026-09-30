@@ -7,6 +7,7 @@ const UI_FILES: &[&str] = &[
     "src/app.rs",
     "src/overlay.rs",
     "src/hotkey.rs",
+    "src/look.rs",
     "src/capture/macos.rs",
 ];
 

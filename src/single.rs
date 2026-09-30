@@ -10,7 +10,7 @@ pub enum Instance {
 
 #[cfg(windows)]
 mod imp {
-    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
     use windows_sys::Win32::System::Threading::{
         CreateEventW, INFINITE, SetEvent, WaitForSingleObject,
     };
@@ -25,25 +25,47 @@ mod imp {
     // The event handle is only waited on and signalled; both are thread-safe.
     unsafe impl Send for Primary {}
 
+    // Frees the slot when the app gives up before its window is up.
+    impl Drop for Primary {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
+
     pub fn acquire(show_existing: bool, dev: bool) -> Instance {
         // Development builds run next to the real copy.
         if dev {
             return Instance::Primary(Primary(std::ptr::null_mut()));
         }
         let name: Vec<u16> = NAME.encode_utf16().chain(Some(0)).collect();
-        // Auto-reset event: one signal wakes the listener once.
-        let h = unsafe { CreateEventW(std::ptr::null(), 0, 0, name.as_ptr()) };
-        if h.is_null() {
-            // Can't coordinate; better to run than to refuse.
-            return Instance::Primary(Primary(h));
-        }
-        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-            if show_existing {
+        // A copy relaunched after a failed start waits for the failed one to
+        // exit and free the slot.
+        let tries = if std::env::var_os(crate::render::RELAUNCHED_VAR).is_some() {
+            50
+        } else {
+            1
+        };
+        for attempt in 1..=tries {
+            // Auto-reset event: one signal wakes the listener once.
+            let h = unsafe { CreateEventW(std::ptr::null(), 0, 0, name.as_ptr()) };
+            if h.is_null() {
+                // Can't coordinate; better to run than to refuse.
+                return Instance::Primary(Primary(h));
+            }
+            if unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
+                return Instance::Primary(Primary(h));
+            }
+            if attempt == tries && show_existing {
                 unsafe { SetEvent(h) };
             }
-            return Instance::Secondary;
+            unsafe { CloseHandle(h) };
+            if attempt < tries {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
         }
-        Instance::Primary(Primary(h))
+        Instance::Secondary
     }
 
     impl Primary {

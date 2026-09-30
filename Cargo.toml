@@ -1,6 +1,6 @@
 [package]
 name = "scr8"
-version = "1.1.1"
+version = "1.2.0"
 description = "Instant region screenshots bound to global hotkeys"
 license = "MIT"
 rust-version = "1.98"
@@ -11,7 +11,7 @@ auto-launch = "0.6.0"
 chrono = "0.4.45"
 crossbeam-channel = "0.5.17"
 dirs = "7.0.0"
-eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts"] }
+eframe = { version = "0.36.2", default-features = false, features = ["glow", "wgpu", "default_fonts"] }
 # Pure-Rust zlib-rs backend makes the Balanced/Best PNG levels ~2.5x faster.
 flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
 global-hotkey = "0.8.0"
@@ -22,12 +22,18 @@ serde_json = "1.0.151"
 tray-icon = "0.25.1"
 
 [target.'cfg(windows)'.dependencies]
+# The egui fonts, so the Windows area picker (drawn with GDI) matches the UI.
+epaint_default_fonts = "0.36.2"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Security",
+    "Win32_System_LibraryLoader",
     "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [profile.release]
