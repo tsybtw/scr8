@@ -14,6 +14,7 @@ use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
 
 use crate::capture::{self, Frame};
 use crate::config::{PngLevel, Region};
+use crate::encode::encode_png;
 
 #[derive(Clone)]
 pub struct Target {
@@ -82,6 +83,7 @@ impl Engine {
     }
 
     fn capture_loop(&self, keys: Receiver<GlobalHotKeyEvent>, jobs: Sender<Job>) {
+        capture::warm_up();
         let mut names = NameGen::default();
         // Windows registers hotkeys with MOD_NOREPEAT, so holding a combo
         // already yields a single event. macOS needs explicit tracking.
@@ -149,28 +151,6 @@ fn write_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
         }
         r => r,
     }
-}
-
-pub fn encode_png(frame: &Frame, level: PngLevel) -> Result<Vec<u8>, String> {
-    let (w, h) = (frame.width as usize, frame.height as usize);
-    let mut rgb = Vec::with_capacity(w * h * 3);
-    for px in frame.bgrx.as_chunks::<4>().0 {
-        rgb.extend_from_slice(&[px[2], px[1], px[0]]);
-    }
-    let mut out = Vec::with_capacity(w * h + 1024);
-    let mut enc = png::Encoder::new(&mut out, frame.width, frame.height);
-    enc.set_color(png::ColorType::Rgb);
-    enc.set_depth(png::BitDepth::Eight);
-    enc.set_compression(match level {
-        PngLevel::None => png::Compression::NoCompression,
-        PngLevel::Fast => png::Compression::Fast,
-        PngLevel::Balanced => png::Compression::Balanced,
-        PngLevel::Best => png::Compression::High,
-    });
-    let mut writer = enc.write_header().map_err(|e| e.to_string())?;
-    writer.write_image_data(&rgb).map_err(|e| e.to_string())?;
-    writer.finish().map_err(|e| e.to_string())?;
-    Ok(out)
 }
 
 /// Unique, sortable file names even for many shots within one millisecond.
@@ -243,6 +223,18 @@ mod tests {
             "capture {:.2} ms for {}x{}",
             rep.capture_ms, rep.width, rep.height
         );
+        #[cfg(windows)]
+        {
+            let _ = capture::capture_gdi(r);
+            let t = std::time::Instant::now();
+            for _ in 0..7 {
+                capture::capture_gdi(r).expect("gdi");
+            }
+            println!(
+                "gdi capture {:.2} ms",
+                t.elapsed().as_secs_f64() * 1000.0 / 7.0
+            );
+        }
         for row in rep.rows {
             println!(
                 "{:?}: encode {:.1} ms, write {:.1} ms, {} KB",

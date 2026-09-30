@@ -116,7 +116,7 @@ start with it.
   save time:
   - **Fast** (default): fast save, medium-sized files.
   - **No compression**: about as fast as Fast, but huge files.
-  - **Balanced**: slower save, noticeably smaller files than Fast.
+  - **Balanced**: slower save, files slightly smaller than Fast.
   - **Best**: much slower, files only slightly smaller than Balanced.
 
   The exact numbers depend on your computer and on what's on the screen.

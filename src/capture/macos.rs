@@ -1,5 +1,8 @@
-//! CoreGraphics capture. Works on macOS 11+ on both Intel and Apple Silicon.
-//! Region coordinates are global points (origin at the top-left of the main
+//! Screen capture on macOS 11+, Intel and Apple Silicon.
+//!
+//! macOS 15.2+ uses ScreenCaptureKit, Apple's current capture API; older
+//! systems, and any ScreenCaptureKit failure, use CoreGraphics. Region
+//! coordinates are global points (origin at the top-left of the main
 //! display); output is in native pixels (2x on Retina).
 
 use std::ffi::c_void;
@@ -26,6 +29,20 @@ struct CGSize {
 struct CGRect {
     origin: CGPoint,
     size: CGSize,
+}
+
+// So they can be passed to Objective-C methods.
+unsafe impl objc2::Encode for CGPoint {
+    const ENCODING: objc2::Encoding =
+        objc2::Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
+}
+unsafe impl objc2::Encode for CGSize {
+    const ENCODING: objc2::Encoding =
+        objc2::Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
+}
+unsafe impl objc2::Encode for CGRect {
+    const ENCODING: objc2::Encoding =
+        objc2::Encoding::Struct("CGRect", &[CGPoint::ENCODING, CGSize::ENCODING]);
 }
 
 impl CGRect {
@@ -99,6 +116,61 @@ unsafe extern "C" {
     fn CFDataGetBytePtr(data: CFDataRef) -> *const u8;
     fn CFDataGetLength(data: CFDataRef) -> isize;
     fn CFRelease(cf: *const c_void);
+    fn CFRetain(cf: *const c_void) -> *const c_void;
+}
+
+/// ScreenCaptureKit's display-agnostic screenshot of a rectangle
+/// (macOS 15.2+). The framework is loaded at runtime, so the app still
+/// starts on systems that don't have it.
+mod sck {
+    use std::ffi::{c_char, c_int, c_void};
+    use std::sync::{OnceLock, mpsc};
+    use std::time::Duration;
+
+    use block2::RcBlock;
+    use objc2::runtime::{AnyClass, AnyObject};
+    use objc2::{msg_send, sel};
+
+    use super::{CFRetain, CGImageRef, CGRect};
+
+    unsafe extern "C" {
+        fn dlopen(path: *const c_char, mode: c_int) -> *mut c_void;
+    }
+    const RTLD_LAZY: c_int = 1;
+
+    fn manager() -> Option<&'static AnyClass> {
+        static CLASS: OnceLock<Option<&'static AnyClass>> = OnceLock::new();
+        *CLASS.get_or_init(|| {
+            let path = c"/System/Library/Frameworks/ScreenCaptureKit.framework/ScreenCaptureKit";
+            if unsafe { dlopen(path.as_ptr(), RTLD_LAZY) }.is_null() {
+                return None;
+            }
+            let class = AnyClass::get(c"SCScreenshotManager")?;
+            // Only macOS 15.2+ has the rectangle screenshot.
+            class.class_method(sel!(captureImageInRect:completionHandler:))?;
+            Some(class)
+        })
+    }
+
+    /// A retained CGImage of `rect`, or `None` to fall back to CoreGraphics.
+    pub fn capture(rect: CGRect) -> Option<CGImageRef> {
+        let class = manager()?;
+        let (tx, rx) = mpsc::sync_channel::<usize>(1);
+        let done = RcBlock::new(move |image: *mut c_void, _error: *mut AnyObject| {
+            let image = if image.is_null() {
+                0
+            } else {
+                // Only valid during the callback unless retained.
+                (unsafe { CFRetain(image) }) as usize
+            };
+            let _ = tx.send(image);
+        });
+        unsafe {
+            let _: () = msg_send![class, captureImageInRect: rect, completionHandler: &*done];
+        }
+        let image = rx.recv_timeout(Duration::from_secs(2)).ok()?;
+        (image != 0).then_some(image as CGImageRef)
+    }
 }
 
 /// Asks for the Screen Recording permission once. Returns whether it's granted.
@@ -143,6 +215,13 @@ pub fn capture(r: Region) -> Result<Frame, String> {
         return Err("empty region".into());
     }
     let want = CGRect::new(r.x as f64, r.y as f64, r.w as f64, r.h as f64);
+    if let Some(img) = sck::capture(want) {
+        let frame = unsafe { image_to_frame(img) };
+        unsafe { CGImageRelease(img) };
+        if let Some(frame) = frame {
+            return Ok(frame);
+        }
+    }
     let hits: Vec<(Display, CGRect)> = displays()
         .into_iter()
         .filter_map(|d| want.intersect(&d.bounds).map(|i| (d, i)))
@@ -236,6 +315,42 @@ pub fn capture(r: Region) -> Result<Frame, String> {
         height: height as u32,
         bgrx: buf,
     })
+}
+
+/// Pixels of a whole image: copied directly when already BGRX, otherwise
+/// drawn into a BGRX canvas.
+unsafe fn image_to_frame(img: CGImageRef) -> Option<Frame> {
+    unsafe {
+        if let Some(frame) = copy_bgrx(img) {
+            return Some(frame);
+        }
+        let (w, h) = (CGImageGetWidth(img), CGImageGetHeight(img));
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; w * h * 4];
+        let space = CGColorSpaceCreateDeviceRGB();
+        let ctx = CGBitmapContextCreate(
+            buf.as_mut_ptr() as *mut c_void,
+            w,
+            h,
+            8,
+            w * 4,
+            space,
+            K_CG_IMAGE_ALPHA_NONE_SKIP_FIRST | K_CG_BITMAP_BYTE_ORDER_32_LITTLE,
+        );
+        CGColorSpaceRelease(space);
+        if ctx.is_null() {
+            return None;
+        }
+        CGContextDrawImage(ctx, CGRect::new(0.0, 0.0, w as f64, h as f64), img);
+        CGContextRelease(ctx);
+        Some(Frame {
+            width: w as u32,
+            height: h as u32,
+            bgrx: buf,
+        })
+    }
 }
 
 /// Copies a 32-bit little-endian BGRA/BGRX image without conversion.

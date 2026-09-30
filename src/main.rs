@@ -5,6 +5,7 @@ mod autostart;
 mod bench;
 mod capture;
 mod config;
+mod encode;
 mod engine;
 mod hotkey;
 mod icon;

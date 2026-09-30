@@ -38,7 +38,19 @@ pub fn ensure_permission() -> bool {
     true
 }
 
+/// Desktop Duplication when available, otherwise GDI.
 pub fn capture(r: Region) -> Result<Frame, String> {
+    if r.w == 0 || r.h == 0 {
+        return Err("empty region".into());
+    }
+    match super::dda::capture(r) {
+        Some(frame) => Ok(frame),
+        None => capture_gdi(r),
+    }
+}
+
+/// GDI capture: works everywhere (Remote Desktop, no GPU), but slower.
+pub fn capture_gdi(r: Region) -> Result<Frame, String> {
     let (w, h) = (r.w as i32, r.h as i32);
     if w <= 0 || h <= 0 {
         return Err("empty region".into());

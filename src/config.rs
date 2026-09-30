@@ -75,8 +75,8 @@ impl PngLevel {
         match self {
             Self::None => "About as fast as Fast, but huge files",
             Self::Fast => "Fast save, medium files (recommended)",
-            Self::Balanced => "Slower save, noticeably smaller files than Fast",
-            Self::Best => "Much slower, files only slightly smaller than Balanced",
+            Self::Balanced => "Slower save, files slightly smaller than Fast",
+            Self::Best => "Much slower, files only a bit smaller than Balanced",
         }
     }
 

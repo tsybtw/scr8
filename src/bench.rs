@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use crate::capture;
 use crate::config::{PngLevel, Region};
-use crate::engine::encode_png;
+use crate::encode::encode_png;
 
 pub struct Row {
     pub level: PngLevel,
