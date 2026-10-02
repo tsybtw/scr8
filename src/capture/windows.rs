@@ -38,6 +38,7 @@ pub fn ensure_permission() -> bool {
     true
 }
 
+#[cfg(feature = "selftest")]
 pub fn primary_region() -> Region {
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
     let (w, h) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };

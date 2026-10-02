@@ -5,7 +5,6 @@
 //! its window closes, leaving only this small one running.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
@@ -21,6 +20,10 @@ use crate::hotkey::Hotkey;
 use crate::ipc::{self, Status, ToService, ToSettings};
 use crate::tray::{Tray, TrayCmd};
 use crate::{autostart, capture, picker, single};
+
+/// Scripted check for CI, only in builds made with `--features selftest`.
+#[cfg(feature = "selftest")]
+mod selftest;
 
 /// Hands an event to the service loop, from any thread.
 type Waker = Arc<dyn Fn(Wake) + Send + Sync>;
@@ -42,7 +45,8 @@ enum Wake {
     },
     /// Something changed in the engine (e.g. an error).
     Engine,
-    SelfTest(SelfTestStep),
+    #[cfg(feature = "selftest")]
+    SelfTest(selftest::Step),
 }
 
 pub fn run(open_settings: bool, instance: single::Primary) {
@@ -180,9 +184,8 @@ impl Service {
             self.spawn_settings(true);
         }
 
-        if let Some(dir) = std::env::var_os("SCR8_SELFTEST") {
-            start_self_test(PathBuf::from(dir), self.wake.clone());
-        }
+        #[cfg(feature = "selftest")]
+        selftest::start(self.wake.clone());
     }
 
     fn shutdown(&mut self) {
@@ -471,6 +474,7 @@ impl Service {
             },
             Wake::Picked { id, region, reopen } => self.picked(id, region, reopen),
             Wake::Engine => {}
+            #[cfg(feature = "selftest")]
             Wake::SelfTest(step) => self.self_test_step(step),
         }
         self.check_errors();
@@ -497,100 +501,6 @@ fn allow_foreground() {
         windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(
             windows_sys::Win32::UI::WindowsAndMessaging::ASFW_ANY,
         );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Self-test: `SCR8_SELFTEST=<dir>` runs a scripted check (used by CI on real
-// Windows and macOS machines) and writes screenshots and a report there.
-
-enum SelfTestStep {
-    Shoot,
-    OpenSettings,
-    /// Unload the settings window, as closing it does with "keep loaded" off.
-    CloseSettings,
-    Snap(&'static str),
-    EditArea,
-    ClosePicker,
-    Finish,
-}
-
-fn start_self_test(dir: PathBuf, wake: Waker) {
-    let _ = std::fs::create_dir_all(&dir);
-    std::thread::spawn(move || {
-        let step = |s, wait_ms| {
-            wake(Wake::SelfTest(s));
-            std::thread::sleep(Duration::from_millis(wait_ms));
-        };
-        std::thread::sleep(Duration::from_secs(2));
-        step(SelfTestStep::Shoot, 1500);
-        step(SelfTestStep::OpenSettings, 4000);
-        step(SelfTestStep::Snap("settings.png"), 500);
-        step(SelfTestStep::EditArea, 3000);
-        step(SelfTestStep::Snap("picker.png"), 500);
-        step(SelfTestStep::ClosePicker, 1500);
-        // Unload the window and open a fresh one.
-        step(SelfTestStep::CloseSettings, 2000);
-        step(SelfTestStep::OpenSettings, 4000);
-        step(SelfTestStep::Snap("settings-reopened.png"), 500);
-        step(SelfTestStep::Finish, 0);
-    });
-}
-
-impl Service {
-    fn self_test_step(&mut self, step: SelfTestStep) {
-        let Some(dir) = std::env::var_os("SCR8_SELFTEST").map(PathBuf::from) else {
-            return;
-        };
-        match step {
-            SelfTestStep::Shoot => {
-                // As if the first bind's hotkey was pressed.
-                if let Some(bind) = self.cfg.binds.first()
-                    && let Some(&id) = self.shot_ids.get(&bind.id)
-                {
-                    for state in [HotKeyState::Pressed, HotKeyState::Released] {
-                        let _ = self.key_tx.send(GlobalHotKeyEvent { id, state });
-                    }
-                }
-            }
-            SelfTestStep::OpenSettings => self.open_settings(),
-            SelfTestStep::CloseSettings => {
-                if let Some(link) = &self.link {
-                    link.send(&ToSettings::Exit);
-                }
-            }
-            SelfTestStep::Snap(name) => {
-                let path = dir.join(name);
-                let result = capture::capture(capture::primary_region())
-                    .and_then(|f| crate::encode::encode_png(&f, crate::config::PngLevel::Fast))
-                    .and_then(|png| std::fs::write(&path, png).map_err(|e| e.to_string()));
-                if let Err(e) = result {
-                    let _ = std::fs::write(dir.join(format!("{name}.error.txt")), e);
-                }
-            }
-            SelfTestStep::EditArea => {
-                if let Some(id) = self.cfg.binds.first().map(|b| b.id) {
-                    self.edit_area(id);
-                }
-            }
-            SelfTestStep::ClosePicker => picker::cancel(),
-            SelfTestStep::Finish => {
-                let report = serde_json::json!({
-                    "saved": self.engine.saved.load(Ordering::Relaxed),
-                    "last_error": self.engine.last_error.lock().unwrap().clone(),
-                    "bind_errors": self.bind_errors,
-                    "hotkeys_available": self.manager.is_some(),
-                    "settings_connected": self.link.is_some(),
-                    "settings_running": self.settings_alive(),
-                    "service_pid": std::process::id(),
-                    "tray": self.tray.is_some(),
-                    "permission": capture::ensure_permission(),
-                    "capture": capture::backend_status(),
-                });
-                let _ = std::fs::write(dir.join("report.json"), report.to_string());
-                self.quit = true;
-            }
-        }
     }
 }
 

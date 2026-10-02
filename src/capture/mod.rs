@@ -17,6 +17,7 @@ pub use windows::capture_gdi;
 pub use windows::{capture, ensure_permission};
 
 /// The whole main display, in capture coordinates.
+#[cfg(feature = "selftest")]
 pub fn primary_region() -> crate::config::Region {
     #[cfg(windows)]
     {
@@ -29,6 +30,7 @@ pub fn primary_region() -> crate::config::Region {
 }
 
 /// Which capture method is in use, for the self-test report.
+#[cfg(feature = "selftest")]
 pub fn backend_status() -> String {
     #[cfg(windows)]
     {

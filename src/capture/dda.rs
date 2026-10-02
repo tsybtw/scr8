@@ -65,6 +65,7 @@ unsafe impl Send for State {}
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
 /// Whether Desktop Duplication is in use, for the self-test report.
+#[cfg(feature = "selftest")]
 pub fn status() -> String {
     match &*STATE.lock().unwrap() {
         Some(State::Ready(_)) => "Desktop Duplication".into(),

@@ -1,10 +1,14 @@
 [package]
 name = "scr8"
-version = "1.4.0"
+version = "1.4.1"
 description = "Instant region screenshots bound to global hotkeys"
 license = "MIT"
 rust-version = "1.98"
 edition = "2024"
+
+[features]
+# Scripted check run by CI (see ci/). Not part of release builds.
+selftest = []
 
 [dependencies]
 auto-launch = "0.6.0"

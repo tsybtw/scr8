@@ -81,6 +81,7 @@ const K_CG_BITMAP_BYTE_ORDER_32_LITTLE: u32 = 2 << 12;
 unsafe extern "C" {
     fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
     fn CGDisplayBounds(display: u32) -> CGRect;
+    #[cfg(feature = "selftest")]
     fn CGMainDisplayID() -> u32;
     fn CGDisplayCopyDisplayMode(display: u32) -> CGDisplayModeRef;
     fn CGDisplayModeGetPixelWidth(mode: CGDisplayModeRef) -> usize;
@@ -221,6 +222,7 @@ mod sck {
 }
 
 /// How the last capture went (for the self-test report).
+#[cfg(feature = "selftest")]
 pub fn backend_status() -> String {
     sck::STATUS.lock().unwrap().clone()
 }
@@ -262,6 +264,7 @@ fn displays() -> Vec<Display> {
         .collect()
 }
 
+#[cfg(feature = "selftest")]
 pub fn primary_region() -> Region {
     let b = unsafe { CGDisplayBounds(CGMainDisplayID()) };
     Region {

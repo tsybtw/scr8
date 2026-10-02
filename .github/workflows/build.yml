@@ -27,10 +27,12 @@ jobs:
         with:
           name: scr8-windows
           path: scr8-windows.exe
-      # Runs the app on this real Windows machine and keeps screenshots.
+      # Runs a test build on this real Windows machine and keeps screenshots.
+      # Built separately: the self-test code isn't in the release.
+      - run: cargo build --release --features selftest --target-dir target/selftest
       - name: Self-test
         continue-on-error: true
-        run: ./ci/selftest.ps1 -Exe target/release/scr8.exe -Out selftest
+        run: ./ci/selftest.ps1 -Exe target/selftest/release/scr8.exe -Out selftest
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -51,10 +53,18 @@ jobs:
         with:
           name: scr8-macos
           path: target/scr8-macos.dmg
-      # Runs the app on this real Mac and keeps screenshots.
+      # Runs a test build on this real Mac and keeps screenshots.
+      # Built separately: the self-test code isn't in the release.
+      - name: Test build
+        run: |
+          cargo build --release --features selftest --target-dir target/selftest
+          rm -rf target/scr8-selftest.app
+          cp -R target/scr8.app target/scr8-selftest.app
+          cp target/selftest/release/scr8 target/scr8-selftest.app/Contents/MacOS/scr8
+          codesign --force --deep --sign - target/scr8-selftest.app
       - name: Self-test
         continue-on-error: true
-        run: bash ci/selftest.sh target/scr8.app selftest
+        run: bash ci/selftest.sh target/scr8-selftest.app selftest
       - uses: actions/upload-artifact@v7
         if: always()
         with:

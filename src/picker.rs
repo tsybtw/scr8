@@ -23,18 +23,25 @@ pub fn pick_area(initial: Option<Region>) -> Option<Region> {
             .stderr(Stdio::null())
             .spawn()
             .ok()?;
-        *CHILD.lock().unwrap() = Some(child.id());
+        #[cfg(feature = "selftest")]
+        {
+            *CHILD.lock().unwrap() = Some(child.id());
+        }
         let out = child.wait_with_output().ok();
-        *CHILD.lock().unwrap() = None;
+        #[cfg(feature = "selftest")]
+        {
+            *CHILD.lock().unwrap() = None;
+        }
         out.filter(|o| o.status.success())
             .and_then(|o| Region::parse(String::from_utf8_lossy(&o.stdout).trim()))
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), feature = "selftest"))]
 static CHILD: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
 
 /// Closes an open picker as if Esc was pressed (used by the self-test).
+#[cfg(feature = "selftest")]
 pub fn cancel() {
     #[cfg(windows)]
     crate::overlay_win::cancel();

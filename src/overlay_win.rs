@@ -75,7 +75,10 @@ pub fn pick(initial: Option<Region>) -> Option<Region> {
     }
     let hwnds: Vec<HWND> =
         STATE.with_borrow(|s| s.as_ref().unwrap().mons.iter().map(|m| m.hwnd).collect());
-    *OPEN.lock().unwrap() = hwnds.iter().map(|&h| h as isize).collect();
+    #[cfg(feature = "selftest")]
+    {
+        *OPEN.lock().unwrap() = hwnds.iter().map(|&h| h as isize).collect();
+    }
     for &h in &hwnds {
         unsafe {
             ShowWindow(h, SW_SHOW);
@@ -104,6 +107,7 @@ pub fn pick(initial: Option<Region>) -> Option<Region> {
     }
 
     // Tear down outside the borrow: destroying sends messages too.
+    #[cfg(feature = "selftest")]
     OPEN.lock().unwrap().clear();
     let picker = STATE.with_borrow_mut(|s| s.take());
     let picker = picker?;
@@ -568,10 +572,12 @@ thread_local! {
 }
 
 /// The open picker's windows (as integers, to share across threads), so
-/// another thread can close it.
+/// another thread can close it (used by the self-test).
+#[cfg(feature = "selftest")]
 static OPEN: std::sync::Mutex<Vec<isize>> = std::sync::Mutex::new(Vec::new());
 
 /// Closes an open picker as if Esc was pressed.
+#[cfg(feature = "selftest")]
 pub fn cancel() {
     if let Some(&h) = OPEN.lock().unwrap().first() {
         unsafe { PostMessageW(h as HWND, WM_CLOSE, 0, 0) };
