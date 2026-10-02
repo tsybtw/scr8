@@ -103,6 +103,11 @@ start with it.
   background. To exit, click the scr8 icon → **Quit**.
 - **scr8 starts with your computer.** Turn this off on the **Advanced** tab →
   **Start with system**.
+- **Memory.** By default the settings window stays loaded in the background,
+  so it opens instantly. To save memory, untick **Advanced** → **Keep this
+  window loaded**: scr8 then uses about 3 times less memory in the
+  background, and the window takes a moment longer to open. Screenshots are
+  just as fast either way.
 - **Starting scr8 again** just opens the window of the copy that's already
   running.
 - **If a screenshot couldn't be saved** (e.g. the folder was deleted or a

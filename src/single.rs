@@ -35,11 +35,13 @@ mod imp {
     }
 
     pub fn acquire(show_existing: bool, dev: bool) -> Instance {
-        // Development builds run next to the real copy.
-        if dev {
-            return Instance::Primary(Primary(std::ptr::null_mut()));
-        }
-        let name: Vec<u16> = NAME.encode_utf16().chain(Some(0)).collect();
+        // Development builds get their own slot, next to the real copy.
+        let name = if dev {
+            format!("{NAME}-dev")
+        } else {
+            NAME.to_owned()
+        };
+        let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
         // A copy relaunched after a failed start waits for the failed one to
         // exit and free the slot.
         let tries = if std::env::var_os(crate::render::RELAUNCHED_VAR).is_some() {
@@ -58,7 +60,14 @@ mod imp {
                 return Instance::Primary(Primary(h));
             }
             if attempt == tries && show_existing {
-                unsafe { SetEvent(h) };
+                // The user just launched us, so we may bring windows to the
+                // front; pass that on to the running copy.
+                unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(
+                        windows_sys::Win32::UI::WindowsAndMessaging::ASFW_ANY,
+                    );
+                    SetEvent(h);
+                }
             }
             unsafe { CloseHandle(h) };
             if attempt < tries {

@@ -9,12 +9,15 @@ mod encode;
 mod engine;
 mod hotkey;
 mod icon;
+mod ipc;
 mod look;
 #[cfg(not(windows))]
 mod overlay;
 #[cfg(windows)]
 mod overlay_win;
+mod picker;
 mod render;
+mod service;
 mod single;
 mod tray;
 
@@ -46,13 +49,22 @@ fn main() {
         std::process::exit(i32::from(write_icon(size, path).is_err()));
     }
     let hidden = args.iter().any(|a| a == "--hidden");
+    if args.first().map(String::as_str) == Some("--settings") {
+        run_settings(hidden);
+        return;
+    }
     // A manual launch while running shows the existing window; a duplicate
     // autostart just quits.
     let instance = match single::acquire(!hidden, config::is_dev()) {
         single::Instance::Primary(p) => p,
         single::Instance::Secondary => return,
     };
+    // The background part; it opens the settings window unless autostarted.
+    service::run(!hidden, instance);
+}
 
+/// The settings window process (started by the service).
+fn run_settings(hidden: bool) {
     let icon = egui::IconData {
         rgba: icon::rgba(64, icon::Style::App),
         width: 64,
@@ -78,7 +90,7 @@ fn main() {
         options,
         Box::new(|cc| {
             render::mark_started();
-            Ok(Box::new(app::App::new(cc, hidden, instance)))
+            Ok(Box::new(app::App::new(cc, hidden)))
         }),
     );
 }

@@ -38,6 +38,17 @@ pub fn ensure_permission() -> bool {
     true
 }
 
+pub fn primary_region() -> Region {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+    let (w, h) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+    Region {
+        x: 0,
+        y: 0,
+        w: w.max(1) as u32,
+        h: h.max(1) as u32,
+    }
+}
+
 /// Desktop Duplication when available, otherwise GDI.
 pub fn capture(r: Region) -> Result<Frame, String> {
     if r.w == 0 || r.h == 0 {

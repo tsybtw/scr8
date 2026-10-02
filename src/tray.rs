@@ -1,5 +1,5 @@
-use crossbeam_channel::Sender;
-use eframe::egui;
+use std::sync::Arc;
+
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
@@ -19,7 +19,8 @@ pub struct Tray {
 }
 
 impl Tray {
-    pub fn create(ctx: &egui::Context, tx: Sender<TrayCmd>) -> Option<Self> {
+    /// `send` is called (on the UI thread) for each menu choice or click.
+    pub fn create(send: Arc<dyn Fn(TrayCmd) + Send + Sync>) -> Option<Self> {
         let open = MenuItem::new("Open scr8", true, None);
         let quit = MenuItem::new("Quit", true, None);
         let menu = Menu::new();
@@ -27,8 +28,7 @@ impl Tray {
             .ok()?;
         let (open_id, quit_id) = (open.id().clone(), quit.id().clone());
 
-        let c = ctx.clone();
-        let t = tx.clone();
+        let s = send.clone();
         MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
             let cmd = if e.id == open_id {
                 TrayCmd::Show
@@ -37,12 +37,10 @@ impl Tray {
             } else {
                 return;
             };
-            let _ = t.send(cmd);
-            c.request_repaint();
+            s(cmd);
         }));
 
         // Left click opens the window on Windows; macOS shows the menu instead.
-        let c = ctx.clone();
         TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,
@@ -50,8 +48,7 @@ impl Tray {
                 ..
             } = e
             {
-                let _ = tx.send(TrayCmd::Show);
-                c.request_repaint();
+                send(TrayCmd::Show);
             }
         }));
 

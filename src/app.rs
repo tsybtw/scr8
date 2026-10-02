@@ -1,21 +1,18 @@
-use std::collections::HashMap;
+//! The settings window. Runs as its own process (`scr8 --settings`), started
+//! by the background service; it edits the settings file and tells the
+//! service over `ipc` to reload, pause hotkeys while recording one, etc.
+
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, unbounded};
 use eframe::egui::{self, Color32, RichText, ViewportCommand};
-use global_hotkey::hotkey::HotKey;
-use global_hotkey::{GlobalHotKeyManager, HotKeyState};
 
 use crate::config::{Config, PngLevel, Region};
-use crate::engine::{Engine, Target};
 use crate::hotkey::Hotkey;
-use crate::single;
-use crate::tray::{Tray, TrayCmd};
-use crate::{autostart, bench, capture};
+use crate::ipc::{self, Status, ToService, ToSettings};
+use crate::{autostart, bench, capture, picker};
 
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
@@ -61,22 +58,15 @@ enum Wizard {
 
 pub struct App {
     cfg: Config,
-    engine: Engine,
-    manager: Option<GlobalHotKeyManager>,
-    registered: Vec<HotKey>,
-    bind_errors: HashMap<u64, String>,
+    /// Link to the background service, and what it sent us.
+    link: Option<ipc::Sender>,
+    inbox: Receiver<ToSettings>,
+    /// Saved count, errors and hotkey problems, as reported by the service.
+    status: Status,
     tab: Tab,
     recording: Option<(u64, Slot)>,
     selecting: Option<Selecting>,
-    /// Edit-hotkey id -> bind id; read by the hotkey handler.
-    edit_keys: Arc<RwLock<HashMap<u32, u64>>>,
-    edit_rx: Receiver<u64>,
     wizard: Option<(u64, Wizard)>,
-    tray: Option<Tray>,
-    tray_rx: Receiver<TrayCmd>,
-    /// Engine error count already shown; a higher count means a new failure.
-    errors_seen: u64,
-    last_toast: Option<Instant>,
     permission_ok: bool,
     notice: Option<String>,
     bench_source: Option<u64>,
@@ -86,187 +76,72 @@ pub struct App {
     /// hidden on the first frame, then centered when first shown.
     start_hidden: bool,
     needs_centering: bool,
+    first_frame: bool,
+    /// Whether the window is on screen (egui doesn't always know).
+    visible: bool,
 }
 
 impl App {
-    pub fn new(
-        cc: &eframe::CreationContext<'_>,
-        start_hidden: bool,
-        instance: single::Primary,
-    ) -> Self {
-        let cfg = Config::load();
+    pub fn new(cc: &eframe::CreationContext<'_>, start_hidden: bool) -> Self {
+        let (tx, inbox) = unbounded();
         let c = cc.egui_ctx.clone();
-        let (engine, key_tx) = Engine::start(cfg.png_level, move || c.request_repaint());
-        // Screenshot hotkeys go straight to the capture thread; edit hotkeys
-        // come here to open the area picker.
-        let edit_keys: Arc<RwLock<HashMap<u32, u64>>> = Arc::default();
-        let (edit_tx, edit_rx) = unbounded();
-        let (keys, c) = (edit_keys.clone(), cc.egui_ctx.clone());
-        global_hotkey::GlobalHotKeyEvent::set_event_handler(Some(
-            move |e: global_hotkey::GlobalHotKeyEvent| match keys.read().unwrap().get(&e.id) {
-                Some(&bind) => {
-                    if e.state == HotKeyState::Pressed {
-                        let _ = edit_tx.send(bind);
-                        c.request_repaint();
-                    }
-                }
-                None => {
-                    let _ = key_tx.send(e);
-                }
-            },
-        ));
-        let manager = GlobalHotKeyManager::new().ok();
-
-        let (tray_tx, tray_rx): (Sender<TrayCmd>, _) = unbounded();
-        let tray = Tray::create(&cc.egui_ctx, tray_tx.clone());
-        // Launching scr8 again just brings this copy's window up.
-        let c = cc.egui_ctx.clone();
-        instance.listen(move || {
-            let _ = tray_tx.send(TrayCmd::Show);
+        let link = ipc::connect(move |msg| {
+            let _ = tx.send(msg);
             c.request_repaint();
         });
-
-        // A development build must not replace the real autostart entry.
-        if cfg.autostart && !crate::config::is_dev() {
-            let _ = autostart::apply(true);
-        }
 
         let mut style = (*cc.egui_ctx.global_style()).clone();
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
         style.spacing.button_padding = egui::vec2(10.0, 4.0);
         cc.egui_ctx.set_global_style(style);
 
-        let mut app = Self {
-            cfg,
-            engine,
-            manager,
-            registered: Vec::new(),
-            bind_errors: HashMap::new(),
+        let notice = link
+            .is_none()
+            .then(|| "Can't reach the scr8 background process; hotkeys may not work".to_owned());
+        let app = Self {
+            cfg: Config::load(),
+            link,
+            inbox,
+            status: Status {
+                hotkeys_available: true,
+                ..Default::default()
+            },
             tab: Tab::Binds,
             recording: None,
             selecting: None,
-            edit_keys,
-            edit_rx,
             wizard: None,
-            tray,
-            tray_rx,
-            errors_seen: 0,
-            last_toast: None,
             permission_ok: capture::ensure_permission(),
-            notice: None,
+            notice,
             bench_source: None,
             bench_rx: None,
             bench_report: None,
             start_hidden,
             needs_centering: start_hidden,
+            first_frame: true,
+            visible: !start_hidden,
         };
-        if app.manager.is_none() {
-            app.notice = Some("Global hotkeys are unavailable on this system".into());
-        }
-        app.sync_hotkeys();
+        app.tell(ToService::Visible(!start_hidden));
         app
     }
 
-    /// Turns new engine failures into a red tray icon and, at most every
-    /// few seconds, a system notification.
-    fn check_errors(&mut self) {
-        let n = self.engine.errors.load(Ordering::Relaxed);
-        if n == self.errors_seen {
-            return;
-        }
-        self.errors_seen = n;
-        let Some(msg) = self.engine.last_error.lock().unwrap().clone() else {
-            return;
-        };
-        let Some(tray) = self.tray.as_mut() else {
-            return;
-        };
-        tray.set_error(Some(&msg));
-        if self
-            .last_toast
-            .is_none_or(|t| t.elapsed() > Duration::from_secs(10))
-        {
-            self.last_toast = Some(Instant::now());
-            tray.notify("Screenshot not saved", &msg);
+    fn tell(&self, msg: ToService) {
+        if let Some(link) = &self.link {
+            link.send(&msg);
         }
     }
 
     fn clear_errors(&mut self) {
-        *self.engine.last_error.lock().unwrap() = None;
         self.notice = None;
-        if let Some(tray) = self.tray.as_mut() {
-            tray.set_error(None);
-        }
+        self.status.last_error = None;
+        self.tell(ToService::ClearErrors);
     }
 
+    /// Writes the settings file and has the service pick it up.
     fn save(&mut self) {
-        if let Err(e) = self.cfg.save() {
-            self.notice = Some(format!("Can't save settings: {e}"));
+        match self.cfg.save() {
+            Ok(()) => self.tell(ToService::Reload),
+            Err(e) => self.notice = Some(format!("Can't save settings: {e}")),
         }
-    }
-
-    /// Re-registers the hotkeys of every enabled bind and publishes the
-    /// screenshot targets to the engine.
-    fn sync_hotkeys(&mut self) {
-        let Some(manager) = &self.manager else {
-            return;
-        };
-        let _ = manager.unregister_all(&self.registered);
-        self.registered.clear();
-        self.bind_errors.clear();
-        let mut targets = HashMap::new();
-        let mut edits = HashMap::new();
-        let mut used = std::collections::HashSet::new();
-        // While recording, keys must reach our window instead of the OS hook.
-        if self.recording.is_none() {
-            for b in self.cfg.binds.iter().filter(|b| b.enabled) {
-                let mut errors = Vec::new();
-                let mut register = |hk: &Hotkey, what: &str| -> Option<u32> {
-                    let g = hk.to_global()?;
-                    let result = if used.insert(g.id()) {
-                        manager.register(g)
-                    } else {
-                        Err(global_hotkey::Error::AlreadyRegistered(g))
-                    };
-                    match result {
-                        Ok(()) => {
-                            self.registered.push(g);
-                            Some(g.id())
-                        }
-                        Err(global_hotkey::Error::AlreadyRegistered(_)) => {
-                            errors.push(format!("{what} is taken by another bind or app"));
-                            None
-                        }
-                        Err(e) => {
-                            errors.push(format!("Can't register {what}: {e}"));
-                            None
-                        }
-                    }
-                };
-                if let (Some(hk), Some(region), Some(folder)) = (&b.hotkey, b.region, &b.folder)
-                    && let Some(id) = register(hk, "Hotkey")
-                {
-                    targets.insert(
-                        id,
-                        Target {
-                            name: b.name.clone(),
-                            region,
-                            folder: folder.clone(),
-                        },
-                    );
-                }
-                if let Some(hk) = &b.edit_hotkey
-                    && let Some(id) = register(hk, "Edit hotkey")
-                {
-                    edits.insert(id, b.id);
-                }
-                if !errors.is_empty() {
-                    self.bind_errors.insert(b.id, errors.join(". "));
-                }
-            }
-        }
-        *self.engine.targets.write().unwrap() = targets;
-        *self.edit_keys.write().unwrap() = edits;
     }
 
     fn show_window(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
@@ -283,6 +158,14 @@ impl App {
         ctx.send_viewport_cmd(ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(ViewportCommand::Focus);
+        self.visible = true;
+        self.tell(ToService::Visible(true));
+    }
+
+    fn hide_window(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+        self.visible = false;
+        self.tell(ToService::Visible(false));
     }
 
     /// Hides the settings window and runs the picker as a child process.
@@ -291,9 +174,9 @@ impl App {
             self.stop_recording();
         }
         let initial = self.bind(id).and_then(|b| b.region);
-        let reopen = ctx.input(|i| i.viewport().visible()).unwrap_or(false);
+        let reopen = self.visible;
         if reopen {
-            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            self.hide_window(ctx);
         }
         let (tx, rx) = unbounded();
         let c = ctx.clone();
@@ -302,7 +185,7 @@ impl App {
             if reopen {
                 std::thread::sleep(Duration::from_millis(250));
             }
-            let _ = tx.send(pick_area(initial));
+            let _ = tx.send(picker::pick_area(initial));
             c.request_repaint();
         });
         self.selecting = Some(Selecting { id, rx, reopen });
@@ -320,18 +203,18 @@ impl App {
                 b.folder = Some(folder);
             }
             self.save();
-            self.sync_hotkeys();
         }
     }
 
     fn start_recording(&mut self, id: u64, slot: Slot) {
         self.recording = Some((id, slot));
-        self.sync_hotkeys();
+        // Registered hotkeys would swallow the keys we want to see.
+        self.tell(ToService::PauseHotkeys);
     }
 
     fn stop_recording(&mut self) {
         self.recording = None;
-        self.sync_hotkeys();
+        self.tell(ToService::ResumeHotkeys);
     }
 
     fn bind(&self, id: u64) -> Option<&crate::config::Bind> {
@@ -395,21 +278,13 @@ impl App {
     }
 
     fn poll_background(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
-        while let Ok(cmd) = self.tray_rx.try_recv() {
-            match cmd {
-                TrayCmd::Show => self.show_window(ctx, frame),
-                TrayCmd::Quit => {
-                    let _ = self.cfg.save();
-                    self.tray = None;
-                    std::process::exit(0);
-                }
-            }
-        }
-
-        while let Ok(id) = self.edit_rx.try_recv() {
-            let enabled = self.bind(id).is_some_and(|b| b.enabled);
-            if enabled && self.selecting.is_none() && self.recording.is_none() {
-                self.start_select(ctx, id);
+        while let Ok(msg) = self.inbox.try_recv() {
+            match msg {
+                ToSettings::Status(s) => self.status = s,
+                ToSettings::Reload => self.cfg = Config::load(),
+                ToSettings::Show => self.show_window(ctx, frame),
+                ToSettings::Hide => self.hide_window(ctx),
+                ToSettings::Exit => std::process::exit(0),
             }
         }
 
@@ -427,7 +302,6 @@ impl App {
                         b.region = Some(region);
                     }
                     self.save();
-                    self.sync_hotkeys();
                     if self.wizard.is_some_and(|(w, _)| w == id) {
                         self.wizard = Some((id, Wizard::Folder));
                     }
@@ -457,8 +331,14 @@ impl App {
             if self.recording.is_some() {
                 self.stop_recording();
             }
-            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            if self.cfg.keep_settings_open {
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+                self.hide_window(ctx);
+            } else {
+                // Unload: the service starts a fresh window next time.
+                self.tell(ToService::Visible(false));
+                std::process::exit(0);
+            }
         }
     }
 
@@ -489,7 +369,7 @@ impl App {
                 let ids: Vec<u64> = self.cfg.binds.iter().map(|b| b.id).collect();
                 for id in ids {
                     let recording = self.recording.filter(|r| r.0 == id).map(|r| r.1);
-                    let error = self.bind_errors.get(&id).cloned();
+                    let error = self.status.bind_errors.get(&id).cloned();
                     let Some(b) = self.cfg.binds.iter_mut().find(|b| b.id == id) else {
                         continue;
                     };
@@ -651,14 +531,10 @@ impl App {
                 self.recording = None;
             }
             self.save();
-            self.sync_hotkeys();
         }
         if let Some((id, what)) = action {
             match what {
-                Action::Rename | Action::Toggle => {
-                    self.save();
-                    self.sync_hotkeys();
-                }
+                Action::Rename | Action::Toggle => self.save(),
                 Action::Record(slot) => {
                     if self.recording == Some((id, slot)) {
                         self.stop_recording();
@@ -671,7 +547,6 @@ impl App {
                         b.edit_hotkey = None;
                     }
                     self.save();
-                    self.sync_hotkeys();
                 }
                 Action::Select => self.start_select(ui.ctx(), id),
                 Action::Folder => self.pick_folder(id),
@@ -694,7 +569,6 @@ impl App {
         }
         if level != self.cfg.png_level {
             self.cfg.png_level = level;
-            self.engine.set_level(level);
             self.save();
         }
 
@@ -832,6 +706,18 @@ impl App {
                 Err(e) => self.notice = Some(format!("Autostart: {e}")),
             }
         }
+        let mut keep = self.cfg.keep_settings_open;
+        if ui
+            .checkbox(&mut keep, "Keep this window loaded (opens instantly)")
+            .on_hover_text(
+                "Off: the window is unloaded when closed, so scr8 uses much less memory \
+                 in the background, and takes a moment longer to open.",
+            )
+            .changed()
+        {
+            self.cfg.keep_settings_open = keep;
+            self.save();
+        }
         if let Some(path) = Config::path() {
             ui.label(
                 RichText::new(format!("Settings file: {}", path.display()))
@@ -846,9 +732,13 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if std::mem::take(&mut self.start_hidden) {
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+        } else if std::mem::take(&mut self.first_frame) {
+            // Windows may open a window minimized when its launcher isn't
+            // in the foreground; make sure it comes up normally.
+            ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(ViewportCommand::Focus);
         }
         self.poll_background(ctx, frame);
-        self.check_errors();
         if self.selecting.is_some() || self.bench_rx.is_some() {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
@@ -890,10 +780,12 @@ impl eframe::App for App {
 
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
-                let saved = self.engine.saved.load(Ordering::Relaxed);
+                let saved = self.status.saved;
                 ui.label(RichText::new(format!("Saved this session: {saved}")).weak());
-                let err = self.engine.last_error.lock().unwrap().clone();
-                if let Some(e) = err.or_else(|| self.notice.clone()) {
+                let unavailable = (!self.status.hotkeys_available)
+                    .then(|| "Global hotkeys are unavailable on this system".to_owned());
+                let err = self.status.last_error.clone();
+                if let Some(e) = err.or_else(|| self.notice.clone()).or(unavailable) {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("✖").on_hover_text("Dismiss").clicked() {
                             self.clear_errors();
@@ -983,30 +875,6 @@ fn status_dot(ui: &mut egui::Ui, text: &str, color: Color32) {
     ui.label(RichText::new(text).color(color));
     let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
     ui.painter().circle_filled(dot.center(), 4.0, color);
-}
-
-/// Shows the area picker and waits for the result.
-/// Windows draws it right here with GDI; macOS runs it as a child process.
-fn pick_area(initial: Option<Region>) -> Option<Region> {
-    #[cfg(windows)]
-    {
-        crate::overlay_win::pick(initial)
-    }
-    #[cfg(not(windows))]
-    {
-        let exe = std::env::current_exe().ok()?;
-        let mut cmd = Command::new(exe);
-        cmd.arg("--select");
-        if let Some(r) = initial {
-            cmd.arg(r.to_arg());
-        }
-        cmd.stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .and_then(|o| Region::parse(String::from_utf8_lossy(&o.stdout).trim()))
-    }
 }
 
 fn short_path(p: &std::path::Path) -> String {

@@ -81,6 +81,7 @@ const K_CG_BITMAP_BYTE_ORDER_32_LITTLE: u32 = 2 << 12;
 unsafe extern "C" {
     fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
     fn CGDisplayBounds(display: u32) -> CGRect;
+    fn CGMainDisplayID() -> u32;
     fn CGDisplayCopyDisplayMode(display: u32) -> CGDisplayModeRef;
     fn CGDisplayModeGetPixelWidth(mode: CGDisplayModeRef) -> usize;
     fn CGDisplayModeRelease(mode: CGDisplayModeRef);
@@ -123,8 +124,8 @@ unsafe extern "C" {
 /// (macOS 15.2+). The framework is loaded at runtime, so the app still
 /// starts on systems that don't have it.
 mod sck {
-    use std::ffi::{c_char, c_int, c_void};
-    use std::sync::{OnceLock, mpsc};
+    use std::ffi::{CStr, c_char, c_int, c_void};
+    use std::sync::{Mutex, OnceLock, mpsc};
     use std::time::Duration;
 
     use block2::RcBlock;
@@ -138,39 +139,90 @@ mod sck {
     }
     const RTLD_LAZY: c_int = 1;
 
-    fn manager() -> Option<&'static AnyClass> {
-        static CLASS: OnceLock<Option<&'static AnyClass>> = OnceLock::new();
+    /// What happened on the last attempt, for the self-test report.
+    pub static STATUS: Mutex<String> = Mutex::new(String::new());
+
+    fn note(s: impl Into<String>) {
+        *STATUS.lock().unwrap() = s.into();
+    }
+
+    fn manager() -> Result<&'static AnyClass, &'static str> {
+        static CLASS: OnceLock<Result<&'static AnyClass, &'static str>> = OnceLock::new();
         *CLASS.get_or_init(|| {
             let path = c"/System/Library/Frameworks/ScreenCaptureKit.framework/ScreenCaptureKit";
             if unsafe { dlopen(path.as_ptr(), RTLD_LAZY) }.is_null() {
-                return None;
+                return Err("ScreenCaptureKit not available");
             }
-            let class = AnyClass::get(c"SCScreenshotManager")?;
+            let class = AnyClass::get(c"SCScreenshotManager").ok_or("no SCScreenshotManager")?;
             // Only macOS 15.2+ has the rectangle screenshot.
-            class.class_method(sel!(captureImageInRect:completionHandler:))?;
-            Some(class)
+            class
+                .class_method(sel!(captureImageInRect:completionHandler:))
+                .ok_or("no captureImageInRect (macOS < 15.2)")?;
+            Ok(class)
         })
+    }
+
+    /// Text of an NSError, for diagnostics.
+    unsafe fn describe(error: *mut AnyObject) -> String {
+        if error.is_null() {
+            return "no image, no error".into();
+        }
+        unsafe {
+            let desc: *mut AnyObject = msg_send![error, localizedDescription];
+            if desc.is_null() {
+                return "error".into();
+            }
+            let text: *const c_char = msg_send![desc, UTF8String];
+            if text.is_null() {
+                "error".into()
+            } else {
+                CStr::from_ptr(text).to_string_lossy().into_owned()
+            }
+        }
     }
 
     /// A retained CGImage of `rect`, or `None` to fall back to CoreGraphics.
     pub fn capture(rect: CGRect) -> Option<CGImageRef> {
-        let class = manager()?;
-        let (tx, rx) = mpsc::sync_channel::<usize>(1);
-        let done = RcBlock::new(move |image: *mut c_void, _error: *mut AnyObject| {
-            let image = if image.is_null() {
-                0
+        let class = match manager() {
+            Ok(c) => c,
+            Err(why) => {
+                note(why);
+                return None;
+            }
+        };
+        let (tx, rx) = mpsc::sync_channel::<Result<usize, String>>(1);
+        let done = RcBlock::new(move |image: *mut c_void, error: *mut AnyObject| {
+            let result = if image.is_null() {
+                Err(unsafe { describe(error) })
             } else {
                 // Only valid during the callback unless retained.
-                (unsafe { CFRetain(image) }) as usize
+                Ok((unsafe { CFRetain(image) }) as usize)
             };
-            let _ = tx.send(image);
+            let _ = tx.send(result);
         });
         unsafe {
             let _: () = msg_send![class, captureImageInRect: rect, completionHandler: &*done];
         }
-        let image = rx.recv_timeout(Duration::from_secs(2)).ok()?;
-        (image != 0).then_some(image as CGImageRef)
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(Ok(image)) => {
+                note("ScreenCaptureKit ok");
+                Some(image as CGImageRef)
+            }
+            Ok(Err(e)) => {
+                note(format!("ScreenCaptureKit error: {e}"));
+                None
+            }
+            Err(_) => {
+                note("ScreenCaptureKit timed out");
+                None
+            }
+        }
     }
+}
+
+/// How the last capture went (for the self-test report).
+pub fn backend_status() -> String {
+    sck::STATUS.lock().unwrap().clone()
 }
 
 /// Asks for the Screen Recording permission once. Returns whether it's granted.
@@ -208,6 +260,16 @@ fn displays() -> Vec<Display> {
             Display { id, bounds, scale }
         })
         .collect()
+}
+
+pub fn primary_region() -> Region {
+    let b = unsafe { CGDisplayBounds(CGMainDisplayID()) };
+    Region {
+        x: b.origin.x as i32,
+        y: b.origin.y as i32,
+        w: b.size.width.max(1.0) as u32,
+        h: b.size.height.max(1.0) as u32,
+    }
 }
 
 pub fn capture(r: Region) -> Result<Frame, String> {

@@ -95,6 +95,9 @@ pub struct Config {
     pub binds: Vec<Bind>,
     pub png_level: PngLevel,
     pub autostart: bool,
+    /// Keep the settings window process loaded (opens instantly) instead of
+    /// unloading it when closed (saves memory).
+    pub keep_settings_open: bool,
     pub next_id: u64,
 }
 
@@ -104,6 +107,7 @@ impl Default for Config {
             binds: Vec::new(),
             png_level: PngLevel::default(),
             autostart: true,
+            keep_settings_open: true,
             next_id: 0,
         }
     }

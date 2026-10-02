@@ -16,6 +16,30 @@ pub use windows::capture_gdi;
 #[cfg(windows)]
 pub use windows::{capture, ensure_permission};
 
+/// The whole main display, in capture coordinates.
+pub fn primary_region() -> crate::config::Region {
+    #[cfg(windows)]
+    {
+        windows::primary_region()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::primary_region()
+    }
+}
+
+/// Which capture method is in use, for the self-test report.
+pub fn backend_status() -> String {
+    #[cfg(windows)]
+    {
+        dda::status()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::backend_status()
+    }
+}
+
 /// Prepares the fastest capture method ahead of the first screenshot.
 pub fn warm_up() {
     #[cfg(windows)]

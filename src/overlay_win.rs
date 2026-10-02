@@ -75,6 +75,7 @@ pub fn pick(initial: Option<Region>) -> Option<Region> {
     }
     let hwnds: Vec<HWND> =
         STATE.with_borrow(|s| s.as_ref().unwrap().mons.iter().map(|m| m.hwnd).collect());
+    *OPEN.lock().unwrap() = hwnds.iter().map(|&h| h as isize).collect();
     for &h in &hwnds {
         unsafe {
             ShowWindow(h, SW_SHOW);
@@ -103,6 +104,7 @@ pub fn pick(initial: Option<Region>) -> Option<Region> {
     }
 
     // Tear down outside the borrow: destroying sends messages too.
+    OPEN.lock().unwrap().clear();
     let picker = STATE.with_borrow_mut(|s| s.take());
     let picker = picker?;
     for m in &picker.mons {
@@ -563,6 +565,17 @@ struct Picker {
 
 thread_local! {
     static STATE: RefCell<Option<Picker>> = const { RefCell::new(None) };
+}
+
+/// The open picker's windows (as integers, to share across threads), so
+/// another thread can close it.
+static OPEN: std::sync::Mutex<Vec<isize>> = std::sync::Mutex::new(Vec::new());
+
+/// Closes an open picker as if Esc was pressed.
+pub fn cancel() {
+    if let Some(&h) = OPEN.lock().unwrap().first() {
+        unsafe { PostMessageW(h as HWND, WM_CLOSE, 0, 0) };
+    }
 }
 
 impl Picker {

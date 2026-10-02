@@ -64,6 +64,15 @@ unsafe impl Send for State {}
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
+/// Whether Desktop Duplication is in use, for the self-test report.
+pub fn status() -> String {
+    match &*STATE.lock().unwrap() {
+        Some(State::Ready(_)) => "Desktop Duplication".into(),
+        Some(State::Failed(_)) => "GDI (Desktop Duplication unavailable)".into(),
+        None => "not started".into(),
+    }
+}
+
 /// Opens the duplications ahead of the first capture (it takes a while).
 pub fn warm_up() {
     let mut state = STATE.lock().unwrap();
